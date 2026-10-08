@@ -1,0 +1,131 @@
+namespace WebhooksKitTests;
+
+using Osysharp.Identity;
+using Osysharp.Webhooks;
+
+// A BICYCLE REPAIR WORKSHOP — what the webhooks are about is a `Repair`. Mechanics book and work repairs; the manager
+// looks after the workshop's integrations; the owner sees everything, the police's bikes included.
+
+[Role] enum WorkshopRole { Authenticator, Mechanic, Manager, Owner }
+
+partial entity RoleGrant { security { allow read when IsMechanic; } }
+
+policy IsMechanic => RoleGrant.Any(g => g.Member == user
+  && (g.Role == WorkshopRole.Mechanic || g.Role == WorkshopRole.Manager || g.Role == WorkshopRole.Owner));
+policy IsOwner => RoleGrant.Any(g => g.Member == user && g.Role == WorkshopRole.Owner);
+/// The kit's one question: the manager and the owner look after the workshop's webhooks.
+policy ManagesWebhooks => RoleGrant.Any(g => g.Member == user && (g.Role == WorkshopRole.Manager || g.Role == WorkshopRole.Owner));
+
+/// Somebody who signs in to the workshop with a code — all a test needs.
+entity Person : Principal {
+  [MaxLength(200)] string CodeHash = "";
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+    deny read CodeHash when !IsAuthenticator;
+  }
+}
+
+/// Where a repair is. ⚠ Appended, never inserted.
+public enum RepairStage { [Label("Booked")] Booked, [Label("Being worked")] Working, [Label("Ready")] Ready, [Label("Collected")] Collected }
+
+Counter RepairNumber = new() { Start = 1001 };
+
+/// One repair.
+entity Repair {
+  [Counter(RepairNumber)] int Number;
+  [Required, MaxLength(120)] string Bike;
+  /// Who to tell it is ready — personal data, and what the booking site's webhook needs.
+  [Required, Classification(Personal.Contact), MaxLength(200)] string CustomerEmail;
+  RepairStage Stage = RepairStage.Booked;
+  /// A bike the police brought in — only the owner sees those.
+  bool Confidential;
+  security {
+    allow read, create, update when IsMechanic where !Confidential;
+    allow read, create, update when IsOwner;
+  }
+}
+
+// ── what happens to a repair — the workshop's events, which its webhooks go out under ─────────────────────────────────
+
+[Event("A repair is booked")]
+public sealed class RepairBooked { public Repair Repair; }
+
+[Event("A bike is ready")]
+public sealed class ReadyForPickup { public Repair Repair; }
+
+[Event("A bike is collected")]
+public sealed class RepairCollected { public Repair Repair; }
+
+app.Webhooks = new WebhooksSetup { Documents = [new WebhooksKitTests.RepairDocument()] };
+
+/// What a subscriber is sent about a repair.
+public class RepairData {
+  public int Number;
+  public string Bike = "";
+  public RepairStage Stage = RepairStage.Booked;
+  public string CustomerEmail = "";
+}
+
+/// A document about a repair carries the workshop's own shape of it; its log line names it by number.
+public class RepairDocument : WebhookDocument<Repair> {
+  public override string Data(Entity record, Event e) {
+    var r = (Repair)record;
+    return JsonSerializer.Serialize(new RepairData { Number = r.Number, Bike = r.Bike, Stage = r.Stage, CustomerEmail = r.CustomerEmail },
+      new JsonSerializerOptions { EnumsAsNames = true });
+  }
+  public override string Line(Entity record) { return "Repair " + ((Repair)record).Number; }
+  public override string Sample(string name) {
+    return JsonSerializer.Serialize(new RepairData { Number = 1000, Bike = "A sample bike", Stage = RepairStage.Ready, CustomerEmail = "customer@example.com" },
+      new JsonSerializerOptions { EnumsAsNames = true });
+  }
+}
+
+/// A subscription was paused because it kept failing — the owner is told, here as a row on the workshop's notice board.
+[On]
+void NoticeThePause(WebhookPaused e) {
+  new WorkshopNotice { Says = $"The webhook “{e.Subscription.Name}” was paused: {e.Why}" };
+}
+
+entity WorkshopNotice {
+  [Required, MaxLength(500)] string Says;
+  security { allow read when IsOwner; }
+}
+
+// ── the workshop's verbs ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Book a repair. Committed.
+public Guid BookRepair(string bike, string email, bool confidential = false) {
+  var r = new Repair { Bike = bike, CustomerEmail = email, Confidential = confidential };
+  Raise(new RepairBooked { Repair = r });
+  UnitOfWork.Commit();
+  return r.Id;
+}
+
+/// The bike is ready. Committed.
+public void MarkReady(Guid id) {
+  var r = Repair.Single(x => x.Id == id);
+  r.Stage = RepairStage.Ready;
+  Raise(new ReadyForPickup { Repair = r });
+  UnitOfWork.Commit();
+}
+
+/// The bike was collected. Committed.
+public void MarkCollected(Guid id) {
+  var r = Repair.Single(x => x.Id == id);
+  r.Stage = RepairStage.Collected;
+  Raise(new RepairCollected { Repair = r });
+  UnitOfWork.Commit();
+}
+
+// ── what the receiving end got — the tests' stub writes it here ──────────────────────────────────────────────────────
+
+/// One request an endpoint received, as the stub saw it.
+entity Received {
+  [MaxLength(2000)] string Url = "";
+  string Body = "";
+  [MaxLength(200)] string MessageId = "";
+  [MaxLength(40)] string Timestamp = "";
+  [MaxLength(400)] string Signature = "";
+  security { allow read, create when IsAuthenticated || IsAnonymous; }
+}

@@ -1,0 +1,61 @@
+// RETENTION — a document carries personal data, so the delivery log keeps it only `KeepBodies` (three days) after the
+// delivery ends — delivered or given up on — and then removes it, with what the endpoint answered; the line stays,
+// saying when it was removed, for `KeepLog` (thirty days), and then leaves the log too.
+using Osysharp.Identity;
+using Osysharp.Webhooks;
+using WebhooksKitTests;
+using Osysharp.Http;
+
+[Test(Workshop)]
+void a_delivered_document_is_removed_after_three_days_and_its_line_after_thirty() {
+  TestClock.Set(new DateTime(2030, 5, 6, 9, 0, 0));
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  Subscribe();
+  Booked("Folding bike", "zeb-retention-7731@example.test");
+  runas (Mia) { Assert.True(WebhookDelivery.Single().Body!.Contains("zeb-retention-7731")); }
+  // Just under three days: still kept.
+  TestClock.Advance(TimeSpan.FromDays(3) - TimeSpan.FromMinutes(1));
+  Background.Settle();
+  Assert.True(Log()[0].HasBody);
+  // Three days: gone — the line stays, saying so.
+  TestClock.Advance(TimeSpan.FromMinutes(2));
+  Background.Settle();
+  var line = Log()[0];
+  Assert.False(line.HasBody);
+  Assert.Equal(WebhookDeliveryState.Settled, line.State);
+  Assert.Equal(WebhookOutcome.Delivered, line.Outcome);
+  runas (Mia) {
+    Assert.False(WebhookDelivery.Any(d => d.Body != null && d.Body.Contains("zeb-retention-7731")));
+    Assert.NotNull(WebhookDelivery.Single().BodyRemovedAt);
+  }
+  // The line stays until thirty days after it ended…
+  TestClock.Advance(TimeSpan.FromDays(26));
+  Background.Settle();
+  Assert.Equal(1, Log().Count);
+  // …and then leaves the log.
+  TestClock.Advance(TimeSpan.FromDays(1) + TimeSpan.FromHours(2));
+  Background.Settle();
+  Assert.Equal(0, Log().Count);
+}
+
+/// A failed document is kept three days from when it was given up on — what "send again" needs — and then removed,
+/// with what the endpoint answered; it can no longer be sent again, and says why.
+[Test(Workshop)]
+void a_failed_document_is_removed_three_days_after_it_was_given_up_on() {
+  TestClock.Set(new DateTime(2030, 5, 6, 9, 0, 0));
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 410));
+  Subscribe();
+  Booked("Tricycle", "zeb-failed-4410@example.test");
+  Assert.Equal(WebhookDeliveryState.Failed, Log()[0].State);
+  runas (Mia) { Assert.Equal("upstream unavailable", WebhookDelivery.Single().Answer); }
+  TestClock.Advance(TimeSpan.FromDays(3) + TimeSpan.FromMinutes(1));
+  Background.Settle();
+  Assert.False(Log()[0].HasBody);
+  Assert.Equal(WebhookOutcome.GaveUp, Log()[0].Outcome);
+  runas (Mia) {
+    Assert.Null(WebhookDelivery.Single().Answer);
+    Assert.False(WebhookDelivery.Any(d => d.Body != null && d.Body.Contains("zeb-failed-4410")));
+    Assert.Equal("Only a delivery that failed is sent again.",
+                 Assert.Throws<ValidationException>(() => SendWebhookAgain(WebhookDelivery.Single().Id)).Message);
+  }
+}

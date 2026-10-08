@@ -1,0 +1,197 @@
+// DELIVERY — each subscription is sent the events it takes and nothing else, after the commit; a refused document is
+// tried again with doubling waits and given up on after ten tries; a subscription that keeps failing (or whose endpoint
+// says it is gone) is paused and the app told; a failed document can be sent again while it is kept; a paused or removed
+// subscription is sent nothing.
+using Osysharp.Identity;
+using Osysharp.Webhooks;
+using WebhooksKitTests;
+using Osysharp.Http;
+
+[Test(Workshop)]
+void an_event_nobody_takes_costs_nothing() {
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  Subscribe(events: ["repair-collected"]);
+  Booked("Road bike");
+  Assert.Equal(0, Received.Count());
+  Assert.Equal(0, Log().Count);
+}
+
+[Test(Workshop)]
+void each_subscription_is_sent_the_events_it_takes_and_nothing_else() {
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  Subscribe("Booking site", "https://hooks.example.test/booking", ["repair-booked"]);
+  Subscribe("Texts", "https://sms.example.test/ready", ["ready-for-pickup"]);
+  var id = Booked("City bike");
+  runas (Tom) { MarkReady(id); }
+  Background.Settle();
+  Assert.Equal(1, Received.Count(r => r.Url == "https://hooks.example.test/booking"));
+  Assert.Contains("\"type\":\"repair-booked\"", Received.Single(r => r.Url == "https://hooks.example.test/booking").Body);
+  Assert.Contains("\"type\":\"ready-for-pickup\"", Received.Single(r => r.Url == "https://sms.example.test/ready").Body);
+  // The document says what was true when it happened: Ready.
+  Assert.Contains("\"Stage\":\"Ready\"", Received.Single(r => r.Url == "https://sms.example.test/ready").Body);   // by name
+}
+
+/// A refused document waits 1, 2, 4, 8… minutes between tries, and is given up on after ten — the log says so at every
+/// step, and the subscription counts it.
+[Test(Workshop)]
+void a_refused_document_is_tried_again_with_doubling_waits_then_given_up() {
+  TestClock.Set(new DateTime(2030, 5, 6, 9, 0, 0));
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 503));
+  Subscribe();
+  Booked("Cargo bike");
+  var first = Log()[0];
+  Assert.Equal(WebhookDeliveryState.Retrying, first.State);
+  Assert.Equal(1, first.Attempts);
+  Assert.Equal("HTTP 503", first.Problem);
+  Assert.Equal(new DateTime(2030, 5, 6, 9, 1, 0), first.NextAttemptAt);
+  TestClock.Advance(TimeSpan.FromMinutes(1));
+  Background.Settle();
+  Assert.Equal(2, Log()[0].Attempts);
+  Assert.Equal(new DateTime(2030, 5, 6, 9, 3, 0), Log()[0].NextAttemptAt);
+  TestClock.Advance(TimeSpan.FromMinutes(2));
+  Background.Settle();
+  Assert.Equal(3, Log()[0].Attempts);
+  Assert.Equal(new DateTime(2030, 5, 6, 9, 7, 0), Log()[0].NextAttemptAt);
+  for (var tries = 3; tries < 10; tries = tries + 1) {
+    TestClock.Advance(WaitAfter(tries));
+    Background.Settle();
+  }
+  var ended = Log()[0];
+  Assert.Equal(WebhookDeliveryState.Failed, ended.State);
+  Assert.Equal(WebhookOutcome.GaveUp, ended.Outcome);
+  Assert.Equal(10, ended.Attempts);
+  Assert.Equal(10, Received.Count());
+  // About eight and a half hours, start to end.
+  Assert.Equal(TimeSpan.FromMinutes(256), WaitAfter(9));
+  runas (Mia) {
+    var s = WebhookSubscription.Single();
+    Assert.Equal(1, s.FailingInARow);
+    Assert.Equal("HTTP 503", s.LastProblem);
+    Assert.True(s.Active);
+  }
+}
+
+/// Five deliveries in a row given up on: the subscription is paused — nothing more is queued for it — and the app is
+/// told, so somebody looks at the endpoint. Resumed, it is sent events again.
+[Test(Workshop)]
+void a_subscription_that_keeps_failing_is_paused_and_the_app_told() {
+  TestClock.Set(new DateTime(2030, 5, 6, 9, 0, 0));
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 500));
+  Subscribe();
+  runas (Tom) {
+    foreach (var bike in ["One", "Two", "Three", "Four", "Five"]) { BookRepair(bike, "ana@example.test"); }
+  }
+  Background.Settle();
+  for (var tries = 1; tries < 10; tries = tries + 1) {
+    TestClock.Advance(WaitAfter(tries));
+    Background.Settle();
+  }
+  runas (Mia) {
+    var s = WebhookSubscription.Single();
+    Assert.False(s.Active);
+    Assert.Equal(WebhookPause.Failing, s.Paused);
+    Assert.Equal(5, s.FailingInARow);
+    Assert.Contains("Paused", HealthOf(s));
+  }
+  runas (Olga) { Assert.Equal("The webhook “Booking site” was paused: HTTP 500", WorkshopNotice.Single().Says); }
+  // Paused: a sixth booking is not even queued.
+  Booked("Six");
+  Assert.Equal(5, Log().Count);
+  // Resumed with the endpoint fixed: the next one goes.
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  runas (Mia) { ResumeWebhook(WebhookSubscription.Single().Id); }
+  Booked("Seven");
+  Assert.Equal(WebhookDeliveryState.Delivered, Log()[5].State);
+}
+
+/// An endpoint that answers 410 Gone is given up on at once, and its subscription paused.
+[Test(Workshop)]
+void an_endpoint_that_says_it_is_gone_is_paused_at_once() {
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 410));
+  Subscribe();
+  Booked("Kids' bike");
+  var line = Log()[0];
+  Assert.Equal(WebhookDeliveryState.Failed, line.State);
+  Assert.Equal(1, line.Attempts);
+  Assert.Equal("HTTP 410 — the endpoint says it is gone.", line.Problem);
+  runas (Mia) { Assert.Equal(WebhookPause.Failing, WebhookSubscription.Single().Paused); }
+}
+
+/// A failed document is sent again — one more try — when a person asks, while it is kept.
+[Test(Workshop)]
+void a_failed_document_is_sent_again_when_a_person_asks() {
+  TestClock.Set(new DateTime(2030, 5, 6, 9, 0, 0));
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 503));
+  Subscribe();
+  Booked("Fixie");
+  for (var tries = 1; tries < 10; tries = tries + 1) {
+    TestClock.Advance(WaitAfter(tries));
+    Background.Settle();
+  }
+  Assert.Equal(WebhookDeliveryState.Failed, Log()[0].State);
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  runas (Mia) { SendWebhookAgain(WebhookDelivery.Single().Id); }
+  Background.Settle();
+  var line = Log()[0];
+  Assert.Equal(WebhookDeliveryState.Delivered, line.State);
+  Assert.Equal(11, line.Attempts);
+  runas (Mia) {
+    // Only a failed one is sent again.
+    Assert.Equal("Only a delivery that failed is sent again.",
+                 Assert.Throws<ValidationException>(() => SendWebhookAgain(WebhookDelivery.Single().Id)).Message);
+  }
+}
+
+/// Paused or removed, a subscription is sent nothing — what was already queued for it is skipped, and says why.
+[Test(Workshop)]
+void a_paused_or_removed_subscription_is_sent_nothing() {
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  var made = Subscribe();
+  runas (Mia) { PauseWebhook(made.Id); }
+  Booked("Recumbent");
+  Assert.Equal(0, Received.Count());
+  Assert.Equal(0, Log().Count);
+  runas (Mia) { ResumeWebhook(made.Id); }
+  Booked("Unicycle");
+  Assert.Equal(1, Received.Count());
+  runas (Mia) { RemoveWebhook(made.Id); }
+  Booked("Penny-farthing");
+  Assert.Equal(1, Received.Count());
+  // Its line outlives it, naming it as it was.
+  Assert.Equal("Booking site", Log()[0].SubscriptionName);
+}
+
+/// "Send a test" sends a made-up document, signed, tried once — and a test that fails counts for nothing.
+[Test(Workshop)]
+void a_test_is_a_sample_tried_once_that_counts_for_nothing() {
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 500));
+  var made = Subscribe();
+  runas (Mia) { SendTestWebhook(made.Id, "ready-for-pickup"); }
+  Background.Settle();
+  var got = Received.Single();
+  Assert.Contains("A sample bike", got.Body);
+  Assert.True(VerifyWebhook(made.Secret, got.MessageId, got.Timestamp, got.Signature, got.Body));
+  var line = Log()[0];
+  Assert.Equal(WebhookDeliveryState.Failed, line.State);
+  Assert.Equal(1, line.Attempts);
+  runas (Mia) {
+    Assert.Equal(0, WebhookSubscription.Single().FailingInARow);
+    Assert.True(WebhookSubscription.Single().Active);
+  }
+}
+
+/// What a subscription is held to: an https endpoint on a real host, a name, and at least one event this app sends.
+[Test(Workshop)]
+[runas(Mia)]
+void a_subscription_is_refused_with_a_sentence_that_says_why() {
+  Assert.Equal("A webhook goes to an https:// address — what it carries is signed, and must not be read on the way.",
+               Assert.Throws<ValidationException>(() => AddWebhook("Plain", "http://hooks.example.test/x", ["repair-booked"])).Message);
+  Assert.Equal("'localhost' is not a host that can be reached from the internet.",
+               Assert.Throws<ValidationException>(() => AddWebhook("Local", "https://localhost/x", ["repair-booked"])).Message);
+  Assert.Equal("Choose at least one event to send.",
+               Assert.Throws<ValidationException>(() => AddWebhook("None", "https://hooks.example.test/x", [])).Message);
+  Assert.Equal("'repair-painted' is not an event this app sends. It sends: webhooks.webhook-paused, ready-for-pickup, repair-booked, repair-collected.",
+               Assert.Throws<ValidationException>(() => AddWebhook("Odd", "https://hooks.example.test/x", ["repair-painted"])).Message);
+  Assert.Equal("Give the subscription a name — it is how you will recognise it in the list.",
+               Assert.Throws<ValidationException>(() => AddWebhook(" ", "https://hooks.example.test/x", ["repair-booked"])).Message);
+}

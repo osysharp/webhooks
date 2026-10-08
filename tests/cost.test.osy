@@ -1,0 +1,37 @@
+// WHAT REMOVING A SUBSCRIPTION COSTS AS ITS LOG GROWS — its delivery log lines outlive it, and letting go of them reads
+// none of them. The test removes one subscription with two lines and one with twenty, each the only one at the time,
+// and a read per line turns it red with both numbers. The workshop is in workshop.test.osy.
+using Osysharp.Identity;
+using Osysharp.Webhooks;
+using WebhooksKitTests;
+using Osysharp.Http;
+
+/// ⭐ REMOVING A SUBSCRIPTION READS THE SAME HOWEVER LONG ITS LOG IS — the lines let go of it in one statement.
+[Test(Workshop)]
+void removing_a_subscription_reads_the_same_however_long_its_log_is() {
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  var few = Subscribe("Few", "https://hooks.example.test/few", ["repair-booked"]);
+  for (var i = 1; i <= 2; i++) { Booked("Bike " + i); }
+  var fewRows = 0;
+  var fewStatements = 0;
+  runas (Mia) {
+    var mark = Cost.Mark();
+    RemoveWebhook(few.Id);
+    fewRows = Cost.RowsReadSince(mark);
+    fewStatements = Cost.StatementsSince(mark);
+  }
+  var many = Subscribe("Many", "https://hooks.example.test/many", ["repair-booked"]);
+  for (var i = 1; i <= 20; i++) { Booked("Cycle " + i); }
+  runas (Mia) {
+    var mark = Cost.Mark();
+    RemoveWebhook(many.Id);
+    var manyRows = Cost.RowsReadSince(mark);
+    var manyStatements = Cost.StatementsSince(mark);
+    Log.Information("RemoveWebhook: " + fewRows + " rows read / " + fewStatements + " statements with two lines, "
+                    + manyRows + " / " + manyStatements + " with twenty");
+    Assert.Equal(fewRows, manyRows);
+    Assert.Equal(fewStatements, manyStatements);
+  }
+  // The lines outlive it, naming it as it was.
+  Assert.Equal(22, Log().Count(l => l.SubscriptionName == "Few" || l.SubscriptionName == "Many"));
+}

@@ -1,0 +1,95 @@
+// SIGNING — every document is signed the Standard Webhooks way under its subscription's own secret, and the receiver's
+// check (`VerifyWebhook`) accepts it as sent and refuses it changed by one character, under another secret, with
+// another id, or replayed later. The secret is shown once and kept nowhere in the clear; rolling it keeps the old one
+// signing beside the new for a day.
+using Osysharp.Identity;
+using Osysharp.Webhooks;
+using WebhooksKitTests;
+using Osysharp.Http;
+
+[Test(Workshop)]
+void every_document_is_signed_and_the_receivers_check_accepts_it() {
+  TestClock.Set(new DateTime(2030, 5, 6, 9, 0, 0));
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  var made = Subscribe();
+  Assert.StartsWith("whsec_", made.Secret);
+  Booked("Cargo bike, Bullitt");
+  var got = Received.Single();
+  Assert.Equal("https://hooks.example.test/workshop/b00k1ng", got.Url);
+  Assert.StartsWith("msg_", got.MessageId);
+  Assert.StartsWith("v1,", got.Signature);
+  Assert.True(VerifyWebhook(made.Secret, got.MessageId, got.Timestamp, got.Signature, got.Body));
+  // The document: its event by name, when, and the app's own data.
+  Assert.StartsWith("{\"type\":\"repair-booked\",\"timestamp\":\"2030-05-06T09:00:00Z\",\"data\":{", got.Body);
+  Assert.Contains("Cargo bike, Bullitt", got.Body);
+  var line = Log()[0];
+  Assert.Equal(WebhookDeliveryState.Delivered, line.State);
+  Assert.Equal(1, line.Attempts);
+  Assert.Equal(200, line.StatusCode);
+}
+
+/// SECURITY-INVARIANT(webhook-payload-is-signed) — the check a receiver runs refuses anything but the bytes the secret
+/// signed, from that id, now.
+[Test(Workshop)]
+void a_tampered_document_is_refused_by_the_receivers_check() {
+  TestClock.Set(new DateTime(2030, 5, 6, 9, 0, 0));
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  var made = Subscribe();
+  Booked("Cargo bike, Bullitt");
+  var got = Received.Single();
+  // One character changed in the body.
+  Assert.False(VerifyWebhook(made.Secret, got.MessageId, got.Timestamp, got.Signature, got.Body.Replace("Bullitt", "Bullitт")));
+  // Another subscription's secret.
+  Assert.False(VerifyWebhook(NewWebhookSecret(), got.MessageId, got.Timestamp, got.Signature, got.Body));
+  // The signature lifted onto another message id.
+  Assert.False(VerifyWebhook(made.Secret, "msg_00000000000000000000000000000000", got.Timestamp, got.Signature, got.Body));
+  // Nothing signed at all.
+  Assert.False(VerifyWebhook(made.Secret, got.MessageId, got.Timestamp, "", got.Body));
+  // Still good four minutes on…
+  TestClock.Advance(TimeSpan.FromMinutes(4));
+  Assert.True(VerifyWebhook(made.Secret, got.MessageId, got.Timestamp, got.Signature, got.Body));
+  // …and refused as a replay ten minutes on.
+  TestClock.Advance(TimeSpan.FromMinutes(6));
+  Assert.False(VerifyWebhook(made.Secret, got.MessageId, got.Timestamp, got.Signature, got.Body));
+}
+
+/// A rolled secret signs every document from then on — and the old one signs beside it for a day, so a receiver still
+/// holding it accepts them while it moves over. After the day, only the new one.
+[Test(Workshop)]
+void a_rolled_secret_signs_beside_the_old_one_for_a_day() {
+  TestClock.Set(new DateTime(2030, 5, 6, 9, 0, 0));
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  var made = Subscribe();
+  var rolled = "";
+  runas (Mia) { rolled = RollWebhookSecret(made.Id); }
+  Assert.NotEqual(made.Secret, rolled);
+  Booked("Gravel bike");
+  var first = Received.Single();
+  Assert.Equal(2, first.Signature.Split(" ").Length);
+  Assert.True(VerifyWebhook(rolled, first.MessageId, first.Timestamp, first.Signature, first.Body));
+  Assert.True(VerifyWebhook(made.Secret, first.MessageId, first.Timestamp, first.Signature, first.Body));
+  TestClock.Advance(TimeSpan.FromHours(25));
+  Booked("Tandem");
+  var later = Received.Single(r => r.Body.Contains("Tandem"));
+  Assert.Equal(1, later.Signature.Split(" ").Length);
+  Assert.True(VerifyWebhook(rolled, later.MessageId, later.Timestamp, later.Signature, later.Body));
+  Assert.False(VerifyWebhook(made.Secret, later.MessageId, later.Timestamp, later.Signature, later.Body));
+}
+
+/// The secret, and the endpoint's path, are kept nowhere in the clear — not on the subscription, not on a delivery,
+/// not in the audit trail: only sealed. What the page reads is the host and the endings.
+[Test(Workshop)]
+void the_secret_and_the_url_are_kept_nowhere_in_the_clear() {
+  // (The stub keeps no URL here — the receiving end's own record of it is not the kit's.)
+  Http.Post.Stub((url, body, headers) => Answer("", body, headers, 200));
+  var made = Subscribe(url: "https://hooks.example.test/T0k3nInThePath/workshop");
+  Booked("Brompton");
+  Assert.NoTraceOf(made.Secret);
+  Assert.NoTraceOf("T0k3nInThePath");
+  runas (Mia) {
+    var s = WebhookSubscription.Single();
+    Assert.Equal("hooks.example.test", s.Host);
+    Assert.Equal("…" + made.Secret.Substring(made.Secret.Length - 4), s.SecretEnding);
+    Assert.NotEqual(made.Secret, s.SealedSecret);
+  }
+}

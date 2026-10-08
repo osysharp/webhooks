@@ -1,0 +1,58 @@
+// Osysharp.Webhooks — telling OTHER systems, over HTTP, when something happens in the app: an administrator subscribes
+// an endpoint to some of the app's events, and every time one happens the endpoint is sent a signed JSON document,
+// durably — retried with backoff while it is down, given up on in the end, and every attempt in a delivery log.
+//
+// The kit never knows WHAT the events are about — a ticket, an order, a repair — and the app does not tell it: every
+// event the app and its kits raise about a record can be subscribed to, by its label, under the one name the platform
+// derives from its class (an app's `RepairReady` goes out as "repair-ready", a kit's `ArticlePublished` as
+// "knowledge.article-published"). The app raises its events where they happen, and — only to send its own API shape of
+// a record rather than its type and id — says what a document carries:
+//     app.Webhooks = new WebhooksSetup { Documents = [new RepairDocument()] };
+//     public class RepairDocument : WebhookDocument<Repair> {
+//       public override string Data(Entity record, Event e) { return JsonSerializer.Serialize(DataOf((Repair)record)); }
+//     }
+//
+// ⚑ SIGNED, THE STANDARD WAY (standardwebhooks.com). Each request carries `webhook-id` (the same on every retry, so a
+//   receiver can drop a repeat), `webhook-timestamp` and `webhook-signature: v1,<base64 HMAC-SHA256 of "id.timestamp.body">`
+//   under the subscription's own secret. A receiver written in Osy# checks it with `VerifyWebhook`; any other language
+//   with the scheme's published libraries. SECURITY-INVARIANT(webhook-payload-is-signed).
+//
+// ⚑ THE SECRET IS SHOWN ONCE. It is minted by the kit, handed to the person who made the subscription in that one
+//   answer, and kept SEALED (`Crypto.Encrypt`) — no read anywhere answers it again, no log line or delivery record holds
+//   it, and the endpoint's URL (often a credential itself) is sealed the same way. Rolling it keeps the old one signing
+//   beside the new for a day, so the receiver can move over without a gap.
+//
+// ⚑ AFTER THE COMMIT, DURABLE, AND NEVER IN THE REQUEST. The kit hears each event once the work that raised it is
+//   committed and writes one document per subscriber; another run posts it, on a clock due at once — off the request
+//   that raised the event, so a slow endpoint never holds anybody's click — retried with doubling waits while the
+//   endpoint fails, given up after `Attempts`, and a subscription failing `PauseAfter` deliveries in a row is paused
+//   (`WebhookPaused` is raised, for the app to tell its managers). A person can send a failed delivery again while its
+//   document is kept. An event no subscription takes costs one read.
+//
+// ⚑ THE PAYLOAD IS PERSONAL DATA, AND IS KEPT SHORT. The delivery log keeps each document for `KeepBodies` after its
+//   delivery ends — then the document is removed and only the line stays (what, where, when, how it went), for `KeepLog`.
+//   A subscription delivers only what the person who made it may read (the record's own security, as them).
+//
+// ⚑ THE APP SAYS ONE THING — who manages webhooks:
+//     policy ManagesWebhooks => IsAdmin;
+//   …and, since its endpoints are chosen by those people at run time, that the kit may reach any public host:
+//     use Osysharp.Webhooks@0 { egress "*"; }
+//   (the platform still refuses internal addresses, and an `egress deny` the app or its organization sets).
+package Osysharp.Webhooks {
+  version     "0.4.0";
+  minPlatform "0.9.0";
+  summary     "outbound webhooks — an administrator subscribes an endpoint to any of the events the app and its kits raise about a record; each one is sent as a JSON document signed the Standard Webhooks way under a secret shown once and kept sealed, delivered durably after the commit with doubling retries, given up on in the end and the subscription paused when it keeps failing, every attempt in a delivery log whose documents are removed after a short declared retention; only what the subscription's maker may read is ever sent; a settings page to add, test, pause, roll the secret of and remove subscriptions and to send a failed delivery again.";
+  model "model/**/*.osy";
+  // The personal data its own fields hold (`[Classification(Personal.X)]`): the documents it sends.
+  personal Content;
+  use Osysharp.Identity@0;
+  // Each document is posted with `Http.Post`.
+  use Osysharp.Http;
+  // Building and delivering each document, the retries and the retention are workflows.
+  use Osysharp.Workflow;
+  // The settings page — themed by the app.
+  use Osysharp.Ui;
+  // Its endpoints are chosen by the app's people at run time, so the app grants the hosts (`egress "*";` for any).
+  egress consumer;
+  tests "tests";
+}

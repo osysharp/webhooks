@@ -1,0 +1,14 @@
+// The producer's test project for Osysharp.Webhooks — a bicycle repair workshop: a repair is booked, worked and the bike
+// made ready for collection, and the workshop's other systems (its booking site, a text-message service, the owner's
+// spreadsheet) are told by webhook. NOT a helpdesk on purpose: the kit knows nothing of tickets, and this app's events
+// are its own `RepairEvent`s about its own `Repair` rows.
+app WebhooksKitTests {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Identity@0;
+  // Endpoints are chosen by the workshop's people, at run time — any public host.
+  use Osysharp.Webhooks@0 { egress "*"; }
+  use Osysharp.Workflow;
+  use Osysharp.Ui;
+  use Osysharp.Http;
+}

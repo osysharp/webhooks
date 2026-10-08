@@ -1,0 +1,63 @@
+{
+  "platform": {
+    "version": "0.9.0"
+  },
+  "entries": [
+    {
+      "name": "Osysharp.Http",
+      "kind": "package",
+      "version": "1.0.0",
+      "hash": "sha256:4c24068aeea5ef1a155459d4cc332c85d7ee3d96049f2404e54ac860d94beb0f",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Http"
+    },
+    {
+      "name": "Osysharp.Identity",
+      "kind": "package",
+      "version": "0.7.0",
+      "hash": "sha256:a8f780ee024fb27a6c1f909feb86fec10c8a176788acd8546d1380a9243575bd",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:kits/identity",
+      "constraint": "0"
+    },
+    {
+      "name": "Osysharp.Ui",
+      "kind": "package",
+      "version": "2.17.1",
+      "hash": "sha256:17d6d844ed71d4d614d43a6993723da70b2d39241c31e9f9fb58250a5183263c",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Ui"
+    },
+    {
+      "name": "Osysharp.Webhooks",
+      "kind": "package",
+      "version": "0.4.0",
+      "hash": "sha256:8c18c547e76ebde6103ee9daf2b1ceb77ab5dd5c5c02bc222c3ee8e94d767048",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:kits/webhooks",
+      "constraint": "0"
+    },
+    {
+      "name": "Osysharp.Workflow",
+      "kind": "package",
+      "version": "1.0.0",
+      "hash": "sha256:c9b5bb60a8be44efc0030d73b0bd60bdab05926344a68fb4db29dc78ee94c2f8",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Workflow"
+    }
+  ],
+  "bridges": {
+    "searched": [
+      "workspace",
+      "platform"
+    ],
+    "skipped": [
+      "github: offline \u2014 the public catalog was not searched for bridges. Run \u0060osy lock\u0060 with a network to look."
+    ]
+  }
+}

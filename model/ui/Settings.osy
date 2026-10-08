@@ -1,0 +1,468 @@
+namespace Osysharp.Webhooks;
+
+using Osysharp.Ui;
+
+// THE WEBHOOKS PAGE — the endpoints the app sends its events to, each with how it is doing, and the delivery log: every
+// document sent, every try, what the endpoint answered, and "send again" for one that failed while its document is kept.
+//
+// ⚑ A FAILURE IS SAID WHERE IT IS SEEN. A subscription whose endpoint is down says so on its own row — "Last try
+//   refused: HTTP 503", "Paused — its endpoint kept failing", with Resume — and the log can be narrowed to what failed.
+//   Nothing on this page reads a URL or a secret back: the host, the URL's last characters and the secret's ending are
+//   what tell two apart.
+
+/// The Webhooks part of the app's settings area — for those who manage them. Discovered, never wired.
+public class WebhookSettingsSections : ISettingsProvider {
+  public SettingsLink[] Sections() {
+    return [
+      new SettingsLink { Label = "Webhooks", To = "/settings/webhooks", Group = "Integrations", Icon = Icons.Link, Order = 80,
+                         Shown = ManagesWebhooks, Hint = "Tell other systems when something happens here." },
+    ];
+  }
+}
+
+/// The webhooks, as a settings page.
+[Page("/settings/webhooks")] [Layout(SettingsFrame)] [Authorize(ManagesWebhooks)] [Render(CSR)] [Title("Webhooks")]
+[Opens(WebhookSubscription)]
+public component WebhooksSettings() { render { WebhookSubscriptions(); } }
+
+/// One subscription as the page lists it — everything a row says, read in one go.
+public class WebhookLine {
+  public Guid Id;
+  public string Name = "";
+  public string Where = "";
+  public bool Active;
+  public WebhookPause? Paused;
+  public string Events = "";
+  public List<string> EventNames = [];
+  public string Health = "";
+  public bool Failing;
+  public string SecretEnding = "";
+}
+
+/// The subscriptions, each as its row says it.
+[SuppressWarning("cost-unbounded-read")]   // the events of the subscriptions already taken for the page — two hundred at most
+public List<WebhookLine> WebhookLines() {
+  List<WebhookLine> lines = [];
+  var subs = WebhookSubscription.OrderBy(s => s.Name).Take(200).ToList();
+  var ids = subs.Select(s => s.Id).ToList();
+  var events = WebhookSubscriptionEvent.Where(e => ids.Contains(e.Subscription.Id)).ToList();
+  foreach (var s in subs) {
+    var names = events.Where(e => e.Subscription.Id == s.Id).Select(e => e.Event).OrderBy(e => e).ToList();
+    lines.Add(new WebhookLine {
+      Id = s.Id, Name = s.Name, Where = s.Host + (s.Tail != "" ? " " + s.Tail : ""), Active = s.Active, Paused = s.Paused,
+      EventNames = names, Events = string.Join(" · ", names.Select(n => WebhookEventWords(n) != "" ? WebhookEventWords(n) : n)),
+      Health = HealthOf(s), Failing = s.LastTryRefused,
+      SecretEnding = s.SecretEnding,
+    });
+  }
+  return lines;
+}
+
+/// How a subscription is doing, in a line — what its row says under its name.
+public string HealthOf(WebhookSubscription s) {
+  if (s.Paused == WebhookPause.Failing) {
+    if ((s.LastProblem ?? "").StartsWith("HTTP 410")) {
+      return $"Paused {s.PausedAt:d MMM HH:mm} — its endpoint answered that it is gone (HTTP 410). Point it at the right address, then resume it.";
+    }
+    return $"Paused {s.PausedAt:d MMM HH:mm} after {s.FailingInARow} deliveries in a row were given up on — the last: "
+      + $"{Sentence(s.LastProblem ?? "no answer")} Fix the endpoint, then resume it.";
+  }
+  if (s.Paused == WebhookPause.ByPerson) { return $"Paused {s.PausedAt:d MMM HH:mm} — nothing is sent until it is resumed."; }
+  if (s.LastTryRefused) {
+    return $"Last try refused {s.LastFailedAt:d MMM HH:mm} — {Sentence(s.LastProblem ?? "no answer")} It is tried again until it is taken or given up on.";
+  }
+  if (s.LastDeliveredAt != null) { return $"Last delivered {s.LastDeliveredAt:d MMM HH:mm}."; }
+  return "Nothing sent yet.";
+}
+
+/// `words` ending in exactly one full stop.
+public string Sentence(string words) { var w = words.Trim(); return w.EndsWith(".") ? w : w + "."; }
+
+/// The subscriptions, their editor and the delivery log.
+[Composable]
+public component WebhookSubscriptions() {
+  List<WebhookLine> lines = [];
+  List<WebhookEventChoice> choices = [];
+  string kept = "";
+  string notice = "";
+  string problem = "";
+
+  // the editor
+  bool editing = false;
+  Guid? editingId = null;
+  string name = "";
+  string url = "";
+  List<string> chosen = [];
+  bool moving = false;
+  // a secret, shown once
+  string secret = "";
+  string secretFor = "";
+  // removing, testing
+  Guid removing = Guid.Empty;
+  string removingName = "";
+  Guid testing = Guid.Empty;
+  string testEvent = "";
+  // the log
+  bool failedOnly = false;
+  Guid? onlyFor = null;
+  int shown = 25;
+
+  live var log = WebhookDelivery.Where(d => (!failedOnly || d.Outcome == WebhookOutcome.GaveUp || d.State == WebhookDeliveryState.Retrying)
+                                         && (onlyFor == null || d.Subscription.Id == onlyFor))
+    .OrderByDescending(d => d.At).Take(shown);
+  live var failing = WebhookDelivery.Count(d => d.State == WebhookDeliveryState.Failed || d.State == WebhookDeliveryState.Retrying);
+
+  on mount { Load(); }
+
+  action Load() {
+    lines = WebhookLines();
+    choices = WebhookEventChoices();
+    kept = WebhookRetentionWords();
+  }
+
+  action New() {
+    editingId = null; name = ""; url = ""; chosen = []; moving = false; problem = ""; editing = true;
+  }
+  action Open(WebhookLine line) {
+    editingId = line.Id; name = line.Name; url = ""; chosen = line.EventNames.ToList(); moving = false; problem = ""; editing = true;
+  }
+  action Close() { editing = false; }
+  action Toggle(string evt) {
+    var next = chosen.ToList();
+    if (next.Contains(evt)) { next.Remove(evt); } else { next.Add(evt); }
+    chosen = next;
+  }
+  action StartMove() { moving = !moving; url = ""; }
+  action Save() {
+    problem = "";
+    try {
+      if (editingId == null) {
+        var made = AddWebhook(name, url, chosen);
+        secret = made.Secret;
+        secretFor = name.Trim();
+        notice = "“" + name.Trim() + "” added.";
+      } else {
+        ChangeWebhook(editingId!.Value, name, chosen);
+        if (moving && url.Trim() != "") { MoveWebhook(editingId!.Value, url); }
+        notice = "“" + name.Trim() + "” saved.";
+      }
+      editing = false;
+      Load();
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+  action Roll(WebhookLine line) {
+    notice = "";
+    try {
+      secret = RollWebhookSecret(line.Id);
+      secretFor = line.Name;
+      Load();
+    } catch (Exception ex) { notice = ex.Message; }
+  }
+  action DoneWithSecret() { secret = ""; secretFor = ""; }
+  action PauseOrResume(WebhookLine line) {
+    notice = "";
+    try {
+      if (line.Active) { PauseWebhook(line.Id); notice = "“" + line.Name + "” paused — nothing is sent to it until it is resumed."; }
+      else { ResumeWebhook(line.Id); notice = "“" + line.Name + "” resumed — events from now on are sent to it."; }
+      Load();
+    } catch (Exception ex) { notice = ex.Message; }
+  }
+  action AskRemove(WebhookLine line) { removing = line.Id; removingName = line.Name; }
+  action StopRemove() { removing = Guid.Empty; }
+  action Remove() {
+    try { RemoveWebhook(removing); notice = "“" + removingName + "” removed."; removing = Guid.Empty; Load(); }
+    catch (Exception ex) { notice = ex.Message; removing = Guid.Empty; }
+  }
+  action AskTest(WebhookLine line) {
+    testing = line.Id;
+    testEvent = line.EventNames.Count > 0 ? line.EventNames[0] : (choices.Count > 0 ? choices[0].Name : "");
+  }
+  action StopTest() { testing = Guid.Empty; }
+  action Test() {
+    try {
+      SendTestWebhook(testing, testEvent);
+      onlyFor = testing;
+      failedOnly = false;
+      notice = "A sample was sent — its line is at the top of the log.";
+      testing = Guid.Empty;
+    } catch (Exception ex) { notice = ex.Message; testing = Guid.Empty; }
+  }
+  action ShowFor(Guid? id) { onlyFor = id; shown = 25; }
+  action ShowMore() { shown = shown + 25; }
+
+  string Words(string evt) {
+    var c = choices.FirstOrDefault(x => x.Name == evt);
+    return c == null ? evt : c!.Label;
+  }
+
+  render {
+    SettingsPage("Webhooks", description: "Tell other systems when something happens here. Each event is sent to the endpoints that take it as a signed JSON document, and tried again while an endpoint is down.") {
+      if (notice != "") { Alert(notice); }
+      if (secret != "") {
+        Card(title: "The signing secret for “" + secretFor + "”") {
+          Stack(gap: 2, label: "Signing secret") {
+            Text("Copy it into the receiving system now — it is not shown again. The receiver checks every document's webhook-signature header with it.",
+                 fontSize: FontSize.Label, color: Colors.TextSecondary);
+            Box(px: 3, py: 2, rounded: Radius.Md, bg: Colors.Sunken, borderW: 1, border: Colors.Border, maxW: "100%") {
+              Text(secret, fontFamily: Font.Mono, fontSize: FontSize.Label, wordBreak: WordBreak.BreakAll, userSelect: UserSelect.All);
+            }
+            Row { Button("I have copied it", onPress: DoneWithSecret, tone: Tone.Primary, size: Size.Sm); }
+          }
+        }
+      }
+      SettingsSection("Endpoints", description: "Each gets the events it takes, signed with its own secret. One that keeps failing is paused, and says why.") {
+        Stack(gap: 0, role: UiRole.List, label: "Endpoints") {
+          if (lines.Count == 0) {
+            EmptyState("No webhooks yet", body: "Add one to send this app's events to another system — your own service, an automation tool, a data warehouse.");
+          }
+          foreach (var line in lines) {
+            WebhookRow(line, () => Open(line), () => AskTest(line), () => PauseOrResume(line), () => Roll(line),
+                       () => AskRemove(line), () => ShowFor(line.Id));
+          }
+        }
+        Row(gap: 2) { Button("Add a webhook", onPress: New, tone: Tone.Primary, size: Size.Sm, disabled: choices.Count == 0); }
+        if (choices.Count == 0) { Hint("This app sends no events yet."); }
+      }
+      SettingsSection("Delivery log", description: kept) {
+        Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+          Switch("Only what failed" + (failing > 0 ? $" ({failing})" : ""), value: failedOnly);
+          if (onlyFor != null) {
+            Text("One endpoint", fontSize: FontSize.Label, color: Colors.TextSecondary);
+            Button("Show every endpoint", onPress: () => ShowFor(null), tone: Tone.Ghost, size: Size.Sm);
+          }
+        }
+        Stack(gap: 0, role: UiRole.List, label: "Delivery log") {
+          if (log.Count == 0) {
+            EmptyState(failedOnly ? "Nothing has failed" : "Nothing sent yet",
+                       body: failedOnly ? "Every document was taken by its endpoint." : "When an event happens, each document sent for it is listed here.");
+          }
+          foreach (var d in log) { WebhookDeliveryRow(d, Words(d.Event)); }
+        }
+        if (log.Count >= shown) { Row(justify: Justify.Center) { Button("Show 25 more", onPress: ShowMore, tone: Tone.Ghost, size: Size.Sm); } }
+      }
+    }
+    if (editing) {
+      Dialog(editingId == null ? "Add a webhook" : name, onDismiss: Close,
+             subtitle: editingId == null ? "The endpoint gets a signed JSON document each time one of the events you choose happens." : "") {
+        Field("Name", value: name, placeholder: "Order sync");
+        if (editingId == null) {
+          Field("Endpoint", value: url, placeholder: "https://example.com/hooks/orders", type: "url",
+                hint: "An https:// address that answers 2xx when it has the document.");
+        } else {
+          if (moving) {
+            Field("New endpoint", value: url, placeholder: "https://example.com/hooks/orders", type: "url",
+                  hint: "It keeps its secret.");
+          } else {
+            Row { Button("Change the endpoint", onPress: StartMove, tone: Tone.Ghost, size: Size.Sm); }
+          }
+        }
+        Stack(gap: 1, label: "Events") {
+          FieldLabel("Events it takes");
+          foreach (var c in choices) {
+            Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+              EventCheck(c.Label, chosen.Contains(c.Name), () => Toggle(c.Name));
+              Text(c.Name, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted);
+            }
+          }
+        }
+        if (problem != "") { Alert(problem, tone: Tone.Danger); }
+        Row(gap: 2, justify: Justify.End) {
+          Button("Cancel", onPress: Close, tone: Tone.Ghost);
+          Button(editingId == null ? "Add it" : "Save", onPress: Save, tone: Tone.Primary);
+        }
+      }
+    }
+    if (removing != Guid.Empty) {
+      Dialog("Remove “" + removingName + "”?", onDismiss: StopRemove,
+             subtitle: "Nothing more is sent to it, and anything still waiting is not sent. Its lines stay in the log until they age out.") {
+        Row(gap: 2, justify: Justify.End) {
+          Button("Cancel", onPress: StopRemove, tone: Tone.Ghost);
+          Button("Remove it", onPress: Remove, tone: Tone.Danger);
+        }
+      }
+    }
+    if (testing != Guid.Empty) {
+      Dialog("Send a test", onDismiss: StopTest, subtitle: "A made-up document of the event you choose, signed like any other, tried once.") {
+        Dropdown("Event", value: testEvent, options: choices.Select(c => c.Name).ToArray()) { k => Text(Words(k)); }
+        Row(gap: 2, justify: Justify.End) {
+          Button("Cancel", onPress: StopTest, tone: Tone.Ghost);
+          Button("Send it", onPress: Test, tone: Tone.Primary);
+        }
+      }
+    }
+  }
+}
+
+/// What the log keeps, and for how long — said under its heading.
+public string WebhookRetentionWords() {
+  var setup = App.Setting<WebhooksSetup>();
+  return $"Every document sent and every try, newest first. A document is kept {Days(setup.KeepBodies)} after it is delivered "
+    + $"or given up on, then removed; its line stays {Days(setup.KeepLog)}.";
+}
+
+/// One event in the editor — ticked when the subscription takes it; the parent keeps the list.
+component EventCheck(string label, bool on, Action onToggle) {
+  bool ticked = on;
+  render { Checkbox(label, value: ticked, onToggle: onToggle); }
+}
+
+/// "3 days", "1 day", "12 hours".
+public string Days(TimeSpan t) {
+  if (t.TotalDays >= 1) { var d = (int)Math.Floor(t.TotalDays); return d == 1 ? "1 day" : d + " days"; }
+  var h = (int)Math.Floor(t.TotalHours);
+  return h == 1 ? "1 hour" : h + " hours";
+}
+
+/// A JSON document laid out for a person to read — one member a line, indented two spaces a level. What the log shows
+/// of a document: the bytes sent stay as they were (they are what was signed); only their display is laid out. Text that
+/// is not a JSON object or array comes back as it is — this never refuses.
+public string IndentedJson(string text) {
+  var t = text.Trim();
+  if (!t.StartsWith("{") && !t.StartsWith("[")) { return text; }
+  List<string> output = [];
+  var depth = 0;
+  var inString = false;
+  var escaped = false;
+  for (var i = 0; i < t.Length; i = i + 1) {
+    var c = t.Substring(i, 1);
+    if (inString) {
+      output.Add(c);
+      if (escaped) { escaped = false; }
+      else if (c == "\\") { escaped = true; }
+      else if (c == "\"") { inString = false; }
+      continue;
+    }
+    if (c == "\"") { inString = true; output.Add(c); continue; }
+    if (c == " " || c == "\n" || c == "\r" || c == "\t") { continue; }
+    if (c == "{" || c == "[") {
+      // An empty object or array stays on one line.
+      var next = i + 1 < t.Length ? t.Substring(i + 1, 1) : "";
+      if ((c == "{" && next == "}") || (c == "[" && next == "]")) { output.Add(c + next); i = i + 1; continue; }
+      depth = depth + 1;
+      output.Add(c + "\n" + Indent(depth));
+      continue;
+    }
+    if (c == "}" || c == "]") {
+      depth = depth > 0 ? depth - 1 : 0;
+      output.Add("\n" + Indent(depth) + c);
+      continue;
+    }
+    if (c == ",") { output.Add(",\n" + Indent(depth)); continue; }
+    if (c == ":") { output.Add(": "); continue; }
+    output.Add(c);
+  }
+  return string.Join("", output);
+}
+
+string Indent(int depth) {
+  var spaces = "";
+  for (var i = 0; i < depth; i = i + 1) { spaces = spaces + "  "; }
+  return spaces;
+}
+
+/// One subscription: its name, where it goes, what it takes, how it is doing, and what can be done with it.
+component WebhookRow(WebhookLine line, Action onEdit, Action onTest, Action onPause, Action onRoll, Action onRemove, Action onLog) {
+  render {
+    Row(gap: 3, align: Align.Start, py: 3, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: line.Name,
+        opacity: line.Active ? 1 : 0.85) {
+      Box(pt: 1) {
+        if (!line.Active) { Lamp(tone: line.Paused == WebhookPause.Failing ? Tone.Danger : Tone.Warning); }
+        else if (line.Failing) { Lamp(live: true, tone: Tone.Warning); }
+        else { Lamp(lit: true, tone: Tone.Success); }
+      }
+      Stack(gap: 1, grow: 1, minW: "0") {
+        Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+          Text(line.Name, fontWeight: FontWeight.Medium);
+          if (!line.Active) { Badge(line.Paused == WebhookPause.Failing ? "Paused — failing" : "Paused",
+                                    tone: line.Paused == WebhookPause.Failing ? Tone.Danger : Tone.Warning); }
+          else if (line.Failing) { Badge("Retrying", tone: Tone.Warning); }
+        }
+        Text(line.Where, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextSecondary,
+             overflow: Overflow.Hidden, textOverflow: TextOverflow.Ellipsis, whiteSpace: WhiteSpace.Nowrap, minW: "0");
+        Text(line.Events, fontSize: FontSize.Caption, color: Colors.TextSecondary, minW: "0");
+        Text(line.Health, fontSize: FontSize.Caption, color: line.Failing || line.Paused == WebhookPause.Failing ? Colors.Danger : Colors.TextMuted,
+             minW: "0");
+        Text("Signing secret " + line.SecretEnding, fontSize: FontSize.Caption, color: Colors.TextMuted);
+        Row(gap: 1, align: Align.Center, wrap: Wrapping.Wrap, mt: 1) {
+          Button("Edit", onPress: onEdit, tone: Tone.Ghost, size: Size.Sm);
+          Button("Send a test", onPress: onTest, tone: Tone.Ghost, size: Size.Sm);
+          Button(line.Active ? "Pause" : "Resume", onPress: onPause, tone: Tone.Ghost, size: Size.Sm);
+          Button("Roll the secret", onPress: onRoll, tone: Tone.Ghost, size: Size.Sm);
+          Button("Its deliveries", onPress: onLog, tone: Tone.Ghost, size: Size.Sm);
+          Button("Remove", onPress: onRemove, tone: Tone.Ghost, size: Size.Sm);
+        }
+      }
+    }
+  }
+}
+
+/// One line of the log: what, where, when, how it went — and, opened, what was sent and what the endpoint said.
+component WebhookDeliveryRow(WebhookDelivery d, string words) {
+  bool open = false;
+  bool showDocument = false;
+  string said = "";
+  action Toggle() { open = !open; }
+  action ToggleDocument() { showDocument = !showDocument; }
+  action Again() {
+    said = "";
+    try { SendWebhookAgain(d.Id); said = "Sent again — it is being tried."; } catch (Exception ex) { said = ex.Message; }
+  }
+  live var failed = d.State == WebhookDeliveryState.Failed || (d.State == WebhookDeliveryState.Settled && d.Outcome == WebhookOutcome.GaveUp);
+  live var tone = d.State == WebhookDeliveryState.Retrying || d.State == WebhookDeliveryState.Queued ? Tone.Warning
+               : failed ? Tone.Danger : d.State == WebhookDeliveryState.Skipped ? Tone.Default : Tone.Success;
+  live var status = d.State == WebhookDeliveryState.Settled && d.Outcome != null ? d.Outcome.Value.Label : d.State.Label;
+  render {
+    Stack(gap: 1, py: 2, borderBW: 1, border: Colors.Border, role: UiRole.ListItem,
+          label: words + (d.About != "" ? " " + d.About : "") + " to " + d.SubscriptionName) {
+      Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+        Badge(status, tone: tone);
+        Text(words, fontWeight: FontWeight.Medium, fontSize: FontSize.Label);
+        if (d.About != "") { Text(d.About, fontFamily: Font.Mono, fontSize: FontSize.Label, color: Colors.TextSecondary); }
+        if (d.IsTest) { Badge("Test", tone: Tone.Default); }
+        Text("to " + d.SubscriptionName, fontSize: FontSize.Label, color: Colors.TextSecondary, minW: "0");
+        Spacer();
+        Text($"{d.At:d MMM HH:mm}", fontSize: FontSize.Caption, color: Colors.TextMuted, fontFamily: Font.Mono, whiteSpace: WhiteSpace.Nowrap);
+        IconButton(open ? "Hide the details" : "Show the details", Toggle, size: Size.Sm, tone: Tone.Ghost) {
+          Icon(open ? Icons.ChevronUp : Icons.ChevronDown, size: 14);
+        }
+      }
+      // How many tries, and — when it was taken — the status it was taken with. A refusal says its own status below.
+      Text((d.Attempts == 1 ? "1 try" : d.Attempts + " tries")
+           + (d.Problem == null && d.StatusCode != null ? $" · HTTP {d.StatusCode}" : ""),
+           fontSize: FontSize.Caption, color: Colors.TextMuted);
+      if (d.Problem != null && d.State != WebhookDeliveryState.Delivered && d.Outcome != WebhookOutcome.Delivered) {
+        Text(d.Problem!, fontSize: FontSize.Caption, color: tone == Tone.Default ? Colors.TextMuted : Colors.Danger);
+      }
+      if (d.State == WebhookDeliveryState.Retrying && d.NextAttemptAt != null) {
+        Text($"Next try at {d.NextAttemptAt:HH:mm}.", fontSize: FontSize.Caption, color: Colors.TextMuted);
+      }
+      if (open) {
+        Stack(gap: 2, px: 3, py: 2, rounded: Radius.Md, bg: Colors.Sunken, label: "What was sent") {
+          Text(d.Event + " · " + d.Host, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted);
+          if (d.Body != null) {
+            // Laid out for reading, and folded until asked for: a document is long, and the line above says what it is.
+            Row(gap: 2, align: Align.Center) {
+              Button(showDocument ? "Hide the document" : "Show the document", onPress: ToggleDocument, tone: Tone.Ghost, size: Size.Sm);
+            }
+            if (showDocument) {
+              Box(maxH: "360px", overflow: Overflow.Auto, label: "The document") {
+                Text(IndentedJson(d.Body!), fontFamily: Font.Mono, fontSize: FontSize.Caption, whiteSpace: "pre-wrap", wordBreak: WordBreak.BreakWord);
+              }
+            }
+          } else {
+            Text(d.BodyRemovedAt != null ? $"The document was removed {d.BodyRemovedAt:d MMM HH:mm} — it is kept only a short while." : "No document.",
+                 fontSize: FontSize.Caption, color: Colors.TextMuted);
+          }
+          if (d.Answer != null && d.Answer != "") {
+            Text("The endpoint answered:", fontSize: FontSize.Caption, color: Colors.TextMuted);
+            Text(d.Answer!, fontFamily: Font.Mono, fontSize: FontSize.Caption, whiteSpace: "pre-wrap", wordBreak: WordBreak.BreakAll);
+          }
+        }
+        if (d.State == WebhookDeliveryState.Failed && d.Body != null) {
+          Row(gap: 2, align: Align.Center) { Button("Send again", onPress: Again, tone: Tone.Primary, size: Size.Sm); }
+        }
+        if (said != "") { Text(said, fontSize: FontSize.Caption, color: Colors.TextSecondary); }
+      }
+    }
+  }
+}

@@ -1,0 +1,121 @@
+// THE WEBHOOKS PAGE ON SCREEN — driven as the workshop's manager: nothing yet, a subscription added (its secret shown
+// once), a test sent, an endpoint that is down retrying, paused after it kept failing, and the delivery log opened on a
+// failure — wide and on a phone, light and dark. `osy test --pixels` photographs each.
+using Osysharp.Identity;
+using Osysharp.Webhooks;
+using WebhooksKitTests;
+using Osysharp.Http;
+
+[Test(Workshop)]
+void the_page_says_what_webhooks_are_before_there_are_any() {
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Mia);
+  Ui.Visit("/settings/webhooks");
+  Assert.Visible("No webhooks yet");
+  Assert.Visible("Nothing sent yet");
+  Ui.Shot("webhooks-empty-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("webhooks-empty-wide-dark");
+}
+
+[Test(Workshop)]
+void a_webhook_is_added_and_its_secret_shown_once() {
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Mia);
+  Ui.Visit("/settings/webhooks");
+  Ui.Click("Add a webhook");
+  Ui.Fill("Name", "Booking site");
+  Ui.Fill("Endpoint", "http://hooks.example.test/workshop");
+  Ui.Check("A repair is booked");
+  Ui.Check("A bike is ready");
+  Ui.Shot("webhooks-add-dialog-wide-light");
+  Ui.Click("Add it");
+  Assert.Visible("A webhook goes to an https:// address — what it carries is signed, and must not be read on the way.");
+  Ui.Fill("Endpoint", "https://hooks.example.test/workshop");
+  Ui.Click("Add it");
+  Assert.Visible("The signing secret for “Booking site”");
+  Assert.Visible("Copy it into the receiving system now — it is not shown again.");
+  Ui.Shot("webhooks-secret-once-wide-light");
+  Ui.Click("I have copied it");
+  Assert.Hidden("The signing secret for “Booking site”");
+  Assert.Visible("hooks.example.test");
+  Assert.Visible("Nothing sent yet.");
+  // A test goes, and lands in the log.
+  Ui.Click("Send a test");
+  Ui.Click("Send it");
+  Background.Settle();
+  Ui.Visit("/settings/webhooks");
+  Assert.Visible("Delivered");
+  Assert.Visible("Test");
+  Ui.Shot("webhooks-one-delivered-wide-light");
+}
+
+[Test(Workshop)]
+void an_endpoint_that_is_down_is_said_on_its_row_and_in_the_log() {
+  TestClock.Set(new DateTime(2030, 5, 6, 9, 0, 0));
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 503));
+  Subscribe("Booking site", "https://hooks.example.test/workshop");
+  Subscribe("Texts", "https://sms.example.test/ready", ["ready-for-pickup"]);
+  Booked("Cargo bike");
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Mia);
+  Ui.Visit("/settings/webhooks");
+  Assert.Visible("Retrying");
+  Assert.Visible("Waiting to try again");
+  Ui.Click("Show the details", within: "A repair is booked Repair 1002 to Booking site");
+  Assert.Visible("upstream unavailable");
+  // The document is folded until asked for, then laid out one member a line.
+  Assert.Hidden("\"type\": \"repair-booked\"");
+  Ui.Click("Show the document", within: "A repair is booked Repair 1002 to Booking site");
+  Assert.Visible("\"type\": \"repair-booked\"");
+  Ui.Shot("webhooks-document-wide-light");
+  Ui.Click("Hide the document", within: "A repair is booked Repair 1002 to Booking site");
+  Ui.Shot("webhooks-retrying-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("webhooks-retrying-wide-dark");
+  Ui.Theme("light");
+  Ui.Viewport(390, 844);
+  Ui.Visit("/settings/webhooks");
+  Assert.NoOverflow();
+  Ui.Shot("webhooks-retrying-phone-light");
+}
+
+[Test(Workshop)]
+void a_subscription_paused_for_failing_says_why_and_a_failed_delivery_can_be_sent_again() {
+  TestClock.Set(new DateTime(2030, 5, 6, 9, 0, 0));
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 410));
+  Subscribe();
+  Booked("Gravel bike");
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Mia);
+  Ui.Visit("/settings/webhooks");
+  Assert.Visible("Paused — failing");
+  Assert.Visible("Resume");
+  Ui.Click("Only what failed (1)");
+  Ui.Click("Show the details", within: "A repair is booked Repair 1002 to Booking site");
+  Assert.Visible("HTTP 410 — the endpoint says it is gone.");
+  Assert.Visible("Send again");
+  Ui.Shot("webhooks-failed-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("webhooks-failed-wide-dark");
+  Ui.Theme("light");
+  Ui.Click("Send again");
+  Background.Settle();
+  Ui.Visit("/settings/webhooks");
+  Assert.Visible("Delivered");
+  Ui.Viewport(390, 844);
+  Ui.Visit("/settings/webhooks");
+  Assert.NoOverflow();
+  Ui.Shot("webhooks-paused-phone-light");
+}
+
+/// A document is laid out for reading — one member a line, two spaces a level, strings (with their commas, braces and
+/// escaped quotes) left as they are, and an empty object on one line.
+[Test]
+void a_document_is_laid_out_one_member_a_line() {
+  Assert.Equal("{\n  \"type\": \"repair-booked\",\n  \"data\": {\n    \"bike\": \"Cargo, \\\"blue\\\" {x}\",\n    \"tags\": [\n      1,\n      2\n    ],\n    \"extra\": {}\n  }\n}",
+               IndentedJson("{\"type\":\"repair-booked\",\"data\":{\"bike\":\"Cargo, \\\"blue\\\" {x}\",\"tags\":[1,2],\"extra\":{}}}"));
+  Assert.Equal("not json", IndentedJson("not json"));
+}

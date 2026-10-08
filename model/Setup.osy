@@ -1,0 +1,108 @@
+namespace Osysharp.Webhooks;
+
+using Osysharp.Identity;
+
+// THE CONTRACT — what can be subscribed to, what each document carries, and how patient delivery is.
+//
+// ⚑ EVERY EVENT IS SUBSCRIBABLE, BY ITS OWN NAME. What happens in the app — its own events and every kit's — is what an
+//   endpoint may be sent: each event about a record, under the name the platform derives from its class
+//   (`Events.Name(e)`: an app's `TicketArrived` is "ticket-arrived", a kit's `ArticlePublished` is
+//   "knowledge.article-published"), by its label. The app raises them where they happen and names nothing here.
+
+/// Who manages webhooks — adds, tests, pauses and removes subscriptions, and reads the delivery log.
+/// `policy ManagesWebhooks => IsAdmin;`
+policy ManagesWebhooks;
+
+/// `app.Webhooks = new WebhooksSetup { Documents = [new OrderDocument()] };` — only to say what a document carries.
+[AppSetting("Webhooks")]
+public class WebhooksSetup {
+  /// What a document about a kind of record carries — one `WebhookDocument<T>` per record type whose own API shape the
+  /// app wants sent. A record with none is sent as its type and id, which a receiver reads back through the app's API.
+  public List<WebhookDocumentBase> Documents = [];
+  /// How many times one document is tried in TOTAL before it is given up on — the first try included.
+  public int Attempts = 10;
+  /// The wait after the first failed try; each wait after it doubles (1, 2, 4, 8 minutes…), never longer than
+  /// `LongestWait`. Ten tries with these two span about eight and a half hours.
+  public TimeSpan FirstWait = TimeSpan.FromMinutes(1);
+  public TimeSpan LongestWait = TimeSpan.FromHours(6);
+  /// How long a delivery's DOCUMENT is kept once it has been delivered or given up on — what "send it again" needs.
+  /// Then it is removed, and the log keeps only its line. A document carries personal data: keep this short.
+  public TimeSpan KeepBodies = TimeSpan.FromDays(3);
+  /// How long a delivery's line stays in the log.
+  public TimeSpan KeepLog = TimeSpan.FromDays(30);
+  /// A subscription whose deliveries are given up on this many times IN A ROW is paused — nothing more is queued for it
+  /// until a person resumes it — and `WebhookPaused` is raised, for the app to tell whoever looks after it.
+  public int PauseAfter = 5;
+}
+
+/// What a document about one kind of record carries — declare a `WebhookDocument<T>`, never this. Every method runs on
+/// the server, as the app, once the work that raised the event is committed.
+public class WebhookDocumentBase {
+  /// The record type, by full name — `WebhookDocument<T>` answers it.
+  public virtual string Record { get { return ""; } }
+
+  /// The `data` of the document about `record` when `e` happened, as JSON — the app's own API shape, serialized
+  /// (`JsonSerializer.Serialize(DataOf(order))`). Kept unchanged for every retry. "" or null: nothing is sent.
+  public virtual string Data(Entity record, Event e) {
+    return "{\"id\":" + JsonSerializer.Serialize(record.Id.ToString()) + ",\"type\":" + JsonSerializer.Serialize(Records.Type(record)) + "}";
+  }
+
+  /// What the record is called on its line in the delivery log — "#1042". The line outlives the document, so keep
+  /// personal data out of it: a number, never a name. "" for the record's noun.
+  public virtual string Line(Entity record) { return ""; }
+
+  /// A sample document for "Send a test" of event `name` — what `data` looks like, made up.
+  public virtual string Sample(string name) { return "{\"test\":true}"; }
+}
+
+/// What a document about the app's record type `T` carries:
+///
+///     public class OrderDocument : WebhookDocument<Order> {
+///       public override string Data(Entity record, Event e) { return JsonSerializer.Serialize(DataOf((Order)record)); }
+///       public override string Line(Entity record) { return "Order " + ((Order)record).Number; }
+///     }
+public class WebhookDocument<T> : WebhookDocumentBase {
+  public string RecordName = typeof(T).FullName;
+  public override string Record { get { return RecordName; } }
+}
+
+/// A subscription was paused because its endpoint kept failing (or said it is gone) — the people who look after
+/// webhooks should look at it: `[On] void TellAdmins(WebhookPaused e) { NotifyAll(admins, e); }`.
+[Event("A webhook was paused")]
+public sealed class WebhookPaused {
+  public WebhookSubscription Subscription;
+  /// The last thing the endpoint said — "HTTP 503".
+  public string Why = "";
+  public override string Sentence() {
+    return Why != "" ? $"Paused: its endpoint kept failing — {Why}" : "Paused: its endpoint kept failing.";
+  }
+}
+
+/// What a document about `record` carries — the app's `WebhookDocument` for its type (or a type it derives from), else
+/// the platform's default.
+public WebhookDocumentBase DocumentFor(string record) {
+  foreach (var d in App.Setting<WebhooksSetup>().Documents) {
+    if (d.Record == record || Records.IsA(record, d.Record)) { return d; }
+  }
+  return new WebhookDocumentBase();
+}
+
+/// One event a subscription may take — its name and what it reads as.
+public class WebhookEventChoice {
+  public string Name = "";
+  public string Label = "";
+  /// The record type it is about.
+  public string Source = "";
+}
+
+/// Every event that can be sent — every event about a record the app and its packages declare, by label.
+public List<WebhookEventChoice> WebhookEventChoices() {
+  return Events.Catalog().Where(e => e.About != "")
+    .Select(e => new WebhookEventChoice { Name = e.Name, Label = e.Label, Source = e.About }).ToList();
+}
+
+/// What an event's name reads as — "" when the app no longer has it.
+public string WebhookEventWords(string name) {
+  var c = WebhookEventChoices().FirstOrDefault(x => x.Name == name);
+  return c == null ? "" : c!.Label;
+}

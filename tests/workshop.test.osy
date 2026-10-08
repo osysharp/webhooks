@@ -1,0 +1,68 @@
+// THE WORKSHOP — the fixture every test file shares: Olga owns it (and sees the police's bikes), Mia manages its
+// integrations, Tom fixes bikes. The receiving end is a stub that writes each request it gets as a `Received` row.
+using Osysharp.Identity;
+using Osysharp.Webhooks;
+using WebhooksKitTests;
+using Osysharp.Http;
+
+[TestFixture]
+void Workshop() {
+  var olga = new Person { Email = "olga@workshop.test", DisplayName = "Olga Berg" };
+  new RoleGrant { Member = olga, Role = WorkshopRole.Owner };
+  var mia = new Person { Email = "mia@workshop.test", DisplayName = "Mia Holm" };
+  new RoleGrant { Member = mia, Role = WorkshopRole.Manager };
+  var tom = new Person { Email = "tom@workshop.test", DisplayName = "Tom Ek" };
+  new RoleGrant { Member = tom, Role = WorkshopRole.Mechanic };
+}
+
+principal Olga => Person.Single(p => p.Email == "olga@workshop.test");
+principal Mia  => Person.Single(p => p.Email == "mia@workshop.test");
+principal Tom  => Person.Single(p => p.Email == "tom@workshop.test");
+
+/// What every endpoint answers in these tests — `status` — keeping the request it got as a row, headers and all. A test
+/// registers it: `Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));`.
+HttpResponse Answer(string url, string body, Dictionary<string, string> headers, int status) {
+  new Received { Url = url, Body = body, MessageId = headers["webhook-id"], Timestamp = headers["webhook-timestamp"],
+                 Signature = headers["webhook-signature"] };
+  return new HttpResponse { StatusCode = status, Body = status < 300 ? "ok" : "upstream unavailable" };
+}
+
+/// Mia subscribes an endpoint — the booking site, by default — to the events named.
+WebhookCreated Subscribe(string name = "Booking site", string url = "https://hooks.example.test/workshop/b00k1ng",
+                         List<string>? events = null) {
+  WebhookCreated made = new WebhookCreated();
+  runas (Mia) { made = AddWebhook(name, url, events ?? ["repair-booked", "ready-for-pickup"]); }
+  return made;
+}
+
+/// A repair booked by Tom, after its commit's work is done.
+Guid Booked(string bike, string email = "ana@example.test") {
+  Guid id = Guid.Empty;
+  runas (Tom) { id = BookRepair(bike, email); }
+  Background.Settle();
+  return id;
+}
+
+/// What one delivery says, read by Mia (the log is the managers').
+public class LogLine {
+  public WebhookDeliveryState State;
+  public WebhookOutcome? Outcome;
+  public int Attempts;
+  public int? StatusCode;
+  public string Problem = "";
+  public DateTime? NextAttemptAt;
+  public bool HasBody;
+  public string SubscriptionName = "";
+}
+
+List<LogLine> Log() {
+  List<LogLine> lines = [];
+  runas (Mia) {
+    foreach (var d in WebhookDelivery.OrderBy(x => x.At).ToList()) {
+      lines.Add(new LogLine { State = d.State, Outcome = d.Outcome, Attempts = d.Attempts, StatusCode = d.StatusCode,
+                              Problem = d.Problem ?? "", NextAttemptAt = d.NextAttemptAt, HasBody = d.Body != null,
+                              SubscriptionName = d.SubscriptionName });
+    }
+  }
+  return lines;
+}

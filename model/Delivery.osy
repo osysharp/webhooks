@@ -1,0 +1,482 @@
+namespace Osysharp.Webhooks;
+
+using Osysharp.Identity;
+using Osysharp.Workflow;
+
+// DELIVERY — every event the app raises about a record is heard here, after the commit that raised it, and becomes one
+// document per subscription that takes it; each document is posted, signed, until its endpoint takes it or the attempts
+// run out. Every attempt is on the delivery's line in the log; the document itself is kept only `KeepBodies` after the
+// delivery ends.
+//
+// ⚑ AFTER THE COMMIT, NEVER BEFORE — AND NEVER IN THE REQUEST. The documents are built once the work that raised the
+//   event is committed, so nothing is sent about work that was rolled back, and each reads the record as it was
+//   committed. The POST is not made here: each document is a `WebhookDelivery` row whose run sends it on a clock due at
+//   once, off the request that raised the event, so a slow or failing endpoint never holds anybody's click.
+// ⚑ AN EVENT NO SUBSCRIPTION TAKES COSTS NOTHING. `SendOut` says which events it cares about
+//   (`[Interest(nameof(SubscribedEvents))]`) — the ones some active subscription takes — and the platform keeps that
+//   answer until a subscription changes, so an event nobody subscribed to is never written, delivered or read for. The
+//   subscriptions of the events one commit raised are read ONCE between them (`ActiveWebhooks`, `[OncePerDelivery]`).
+
+/// Every event about a record is sent to each ACTIVE subscription that takes it and whose maker may read the record.
+/// A subscription its maker could not read the record through is sent nothing about it — not even that it happened.
+[On]
+[Interest(nameof(SubscribedEvents))]
+internal void SendOut(Event e) {
+  var record = Events.About(e);
+  if (record == null) { return; }
+  var name = Events.Name(e);
+  var hooks = ActiveWebhooks();
+  var taking = hooks.Takes.Where(x => x.Event == name).Select(x => x.Subscription.Id).ToList();
+  var subs = hooks.Subscriptions.Where(s => taking.Contains(s.Id)).ToList();
+  if (subs.Count == 0) { return; }
+  var document = DocumentFor(Records.Type(record!));
+  var delivery = Events.Delivery();
+  var at = delivery == null ? DateTime.UtcNow : delivery!.RaisedAt;
+  string? data = null;
+  string? about = null;
+  foreach (var s in subs) {
+    // SECURITY-INVARIANT(webhook-sends-only-what-its-maker-may-read): a document about a record goes only to a
+    // subscription whose maker may read that record under their own rules — a subscription is never a way round them.
+    // Guarded by tests/security.test.osy (a_subscription_is_never_sent_a_record_its_maker_may_not_read).
+    if (!Records.MayRead(s.Owner, record!)) { continue; }
+    if (data == null) { data = document.Data(record!, e) ?? ""; }
+    if (data == "") { return; }
+    if (about == null) {
+      var line = document.Line(record!) ?? "";
+      about = line != "" ? line : Records.Noun(record!);
+    }
+    new WebhookDelivery {
+      Subscription = s, SubscriptionName = s.Name, Host = s.Host, Event = name, Record = record, About = Clip(about!, 200),
+      At = DateTime.UtcNow, Body = Envelope(name, at, data!),
+    };
+  }
+}
+
+/// The events some ACTIVE subscription takes, by type — what `SendOut` hears. Kept by the platform until a subscription
+/// changes, so it is read once, not per event.
+List<string> SubscribedEvents() {
+  var names = WebhookSubscriptionEvent.Where(x => x.Subscription.Active).Select(x => x.Event).ToList();
+  List<string> types = [];
+  if (names.Count == 0) { return types; }
+  foreach (var info in Events.Catalog()) {
+    if (names.Contains(info.Name)) { types.Add(info.Type); }
+  }
+  return types;
+}
+
+/// The active subscriptions, with who made each, and the events they take.
+public class ActiveHooks {
+  public List<WebhookSubscription> Subscriptions = [];
+  public List<WebhookSubscriptionEvent> Takes = [];
+}
+
+/// The active subscriptions and what they take — read ONCE for a delivery (`[OncePerDelivery]`): the events one commit
+/// raised are sent out from one read, not one each.
+[OncePerDelivery]
+[SuppressWarning("cost-unbounded-read")]   // the active subscriptions — the app's integrations, set up by hand
+ActiveHooks ActiveWebhooks() {
+  var hooks = new ActiveHooks();
+  hooks.Subscriptions = WebhookSubscription.Where(s => s.Active).Include(s => s.Owner).ToList();
+  if (hooks.Subscriptions.Count > 0) { hooks.Takes = WebhookSubscriptionEvent.Where(x => x.Subscription.Active).ToList(); }
+  return hooks;
+}
+
+/// The document a receiver gets: `{"type": "repairs.ready", "timestamp": "…", "data": {…}}`.
+public string Envelope(string evt, DateTime at, string data) {
+  return "{\"type\":" + JsonSerializer.Serialize(evt) + ",\"timestamp\":" + JsonSerializer.Serialize(at.ToString("yyyy-MM-ddTHH:mm:ssZ"))
+    + ",\"data\":" + data + "}";
+}
+
+// ── the delivery ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Where a delivery has got to. ⚠ Appended, never inserted.
+public enum WebhookDeliveryState {
+  /// About to be tried — at once, or when its wait is over.
+  [Label("Sending")] Queued,
+  /// Tried and refused; waiting before the next try.
+  [Label("Waiting to try again")] Retrying,
+  /// The endpoint took it. Its document is kept a little while, then removed.
+  [Label("Delivered")] Delivered,
+  /// Given up on — every attempt was refused. A person may send it again while its document is kept.
+  [Label("Failed")] Failed,
+  /// Its document is gone; the line stays in the log.
+  [Label("Done")] Settled,
+  /// Not sent: its subscription was paused or removed before it went.
+  [Label("Not sent")] Skipped,
+}
+
+/// How a delivery ended. ⚠ Appended, never inserted.
+public enum WebhookOutcome {
+  [Label("Delivered")] Delivered,
+  [Label("Gave up")] GaveUp,
+  [Label("Not sent")] Skipped,
+}
+
+/// One document to one endpoint — a line in the delivery log.
+public entity WebhookDelivery {
+  /// Where it goes — null once the subscription is removed (the line still names it, as it was).
+  WebhookSubscription? Subscription;
+  [Required, MaxLength(100)] string SubscriptionName;
+  [Required, MaxLength(200)] string Host;
+  /// The event's name — "repair-ready".
+  [Required, MaxLength(140)] string Event;
+  /// The record it is about (none for a test; let go of when the record is deleted — the line stays), and what its
+  /// line calls it ("#1042").
+  [OnDelete(Clear)] Entity? Record;
+  [MaxLength(200)] string About = "";
+  /// "Send a test" — a sample document, tried once.
+  bool IsTest;
+  /// A person asked for it to be sent again after it failed — one more try, even to a paused subscription.
+  bool SentAgain;
+  /// THE DOCUMENT, as signed and sent. Personal data: kept `KeepBodies` after the delivery ends, then removed.
+  [Classification(Personal.Content)] string? Body;
+  /// When it was queued.
+  DateTime At;
+  int Attempts;
+  /// When the next try is due, while it waits.
+  DateTime? NextAttemptAt;
+  DateTime? DeliveredAt;
+  /// When it was delivered, given up on or skipped — what the document's removal counts from.
+  DateTime? EndedAt;
+  /// The status the endpoint last answered with — none when it never answered.
+  int? StatusCode;
+  /// What went wrong on the last try, in a sentence of ours — "HTTP 503", "The endpoint did not answer: …".
+  [MaxLength(500)] string? Problem;
+  /// The start of what the endpoint last answered, in its own words — removed with the document (it can echo it).
+  [Classification(Personal.Content), MaxLength(500)] string? Answer;
+  WebhookOutcome? Outcome;
+  DateTime? BodyRemovedAt;
+  WebhookDeliveryState State;                    // no default — WebhookSending owns it
+
+  security {
+    allow read when ManagesWebhooks;
+    // A test is the managers' to queue; every other line is the kit's run's to write. Nobody edits the record of what
+    // was sent, or removes it before it ages out.
+    allow create when ManagesWebhooks where IsTest;
+    // …and a removed subscription's lines let go of it (`RemoveWebhook`) — the only thing a person changes on one.
+    allow update when ManagesWebhooks;
+    deny update SubscriptionName, Host, Event, Record, About, IsTest, SentAgain, Body, At, Attempts, NextAttemptAt, DeliveredAt, EndedAt,
+                StatusCode, Problem, Answer, Outcome, BodyRemovedAt, State;
+    deny delete;
+  }
+}
+
+/// Sends each delivery after the commit that wrote it, retries it with doubling waits, gives up in the end, and removes
+/// its document once it has been kept long enough.
+public workflow WebhookSending {
+  Tracks    = WebhookDelivery.State;
+  Autostart = true;
+  Initial   = Queued;
+
+  /// A person asked for a failed delivery to be sent again — one more try.
+  event SendAgain();
+
+  state Queued {
+    Expire { Within = TimeSpan.Zero; Accrues = false; }
+    on Expire {
+      var d = this.Item;
+      var why = WhyNotSent(d);
+      if (why != "") {
+        d.Problem = why;
+        d.Outcome = WebhookOutcome.Skipped;
+        d.EndedAt = DateTime.UtcNow;
+        d.Body = null;
+        d.BodyRemovedAt = d.EndedAt;
+        goto Skipped;
+      }
+      // ⛔ ASKED AGAIN AT EVERY SEND: an organization may have taken the host off its allowed list since the
+      //    subscription was made. Not sent, not retried (nothing changes by waiting), and the subscription is paused
+      //    at once with the platform's sentence — the app is told, as for any pause.
+      var blocked = NotAllowed(d);
+      if (blocked != "") {
+        Blocked(d, blocked, DateTime.UtcNow);
+        GiveUp(d, true);
+        goto Failed;
+      }
+      if (TryToDeliver(d, DateTime.UtcNow)) { goto Delivered; }
+      if (d.IsTest || d.SentAgain || d.Attempts >= App.Setting<WebhooksSetup>().Attempts || d.StatusCode == 410) {
+        GiveUp(d, d.StatusCode == 410);
+        goto Failed;
+      }
+      d.NextAttemptAt = DateTime.UtcNow + WaitAfter(d.Attempts);
+      goto Retrying;
+    }
+  }
+
+  /// Refused; waiting before the next try — one minute, then two, four, eight…, never more than `LongestWait`.
+  state Retrying {
+    Expire { Within = WaitAfter(this.Item.Attempts); Accrues = false; }
+    on Expire { goto Queued; }
+  }
+
+  /// Delivered. The document is kept `KeepBodies`, then removed.
+  state Delivered {
+    Expire { Within = App.Setting<WebhooksSetup>().KeepBodies; Accrues = false; }
+    on Expire {
+      RemoveBody(this.Item);
+      goto Settled;
+    }
+  }
+
+  /// Given up on. A person may send it again while its document is kept; then it is removed.
+  state Failed {
+    on SendAgain {
+      this.Item.NextAttemptAt = null;
+      this.Item.SentAgain = true;
+      goto Queued;
+    }
+    Expire { Within = KeptFor(this.Item); Accrues = false; }
+    on Expire {
+      RemoveBody(this.Item);
+      goto Settled;
+    }
+  }
+
+  terminal success Settled { }
+  terminal cancel Skipped { }
+}
+
+/// How long to wait after `attempts` refused tries: `FirstWait`, doubling, never more than `LongestWait`.
+public TimeSpan WaitAfter(int attempts) {
+  var setup = App.Setting<WebhooksSetup>();
+  var wait = setup.FirstWait;
+  for (var i = 1; i < attempts; i = i + 1) {
+    wait = wait + wait;
+    if (wait >= setup.LongestWait) { return setup.LongestWait; }
+  }
+  return wait > setup.LongestWait ? setup.LongestWait : wait;
+}
+
+/// How much longer a failed delivery's document is kept — `KeepBodies` from when it ended (a "send again" does not
+/// extend it).
+TimeSpan KeptFor(WebhookDelivery d) {
+  var until = (d.EndedAt ?? DateTime.UtcNow) + App.Setting<WebhooksSetup>().KeepBodies;
+  var left = until - DateTime.UtcNow;
+  return left < TimeSpan.Zero ? TimeSpan.Zero : left;
+}
+
+/// Why `d` is not to be sent at all — "" when it is. A test goes whatever; anything else only to an active subscription.
+string WhyNotSent(WebhookDelivery d) {
+  if (d.Subscription == null) { return "Its subscription was removed before it was sent."; }
+  if (d.Body == null) { return "Its document was removed before it was sent."; }
+  if (!d.IsTest && !d.SentAgain && !d.Subscription!.Active) { return "Its subscription was paused before it was sent."; }
+  return "";
+}
+
+/// One try: post the document, signed, and record what the endpoint said. True when it took it (any 2xx).
+///
+/// ⚠ A NON-2XX IS DATA, NOT AN EXCEPTION (`Http.*`); a transport failure — DNS, TLS, a refused or internal address, a
+/// timeout — throws, and is the other half.
+[SuppressWarning("reliability-outbound-call-unguarded")]
+bool TryToDeliver(WebhookDelivery d, DateTime now) {
+  var s = d.Subscription!;
+  d.Attempts = d.Attempts + 1;
+  var id = "msg_" + d.Id.ToString().Replace("-", "");
+  var stamp = UnixSeconds(now).ToString();
+  var headers = new Dictionary<string, string>();
+  headers.Add("webhook-id", id);
+  headers.Add("webhook-timestamp", stamp);
+  headers.Add("webhook-signature", SignaturesFor(s, now, id, stamp, d.Body!));
+  var url = Crypto.Decrypt(s.SealedUrl);
+  try {
+    var r = Http.Post(url, d.Body!, "application/json", headers);
+    d.StatusCode = r.StatusCode;
+    if (r.IsSuccess) {
+      d.Problem = null;
+      d.Answer = null;
+      d.NextAttemptAt = null;
+      d.DeliveredAt = now;
+      d.EndedAt = now;
+      d.Outcome = WebhookOutcome.Delivered;
+      s.LastDeliveredAt = now;
+      s.LastTryRefused = false;
+      if (!d.IsTest) { s.FailingInARow = 0; }
+      return true;
+    }
+    d.Problem = r.StatusCode == 410 ? "HTTP 410 — the endpoint says it is gone." : $"HTTP {r.StatusCode}";
+    d.Answer = Clip(r.Body ?? "", 500);
+  } catch (Exception ex) {
+    d.StatusCode = null;
+    // The URL may be a credential, and a transport error can quote it — said by its host only.
+    d.Problem = Clip("The endpoint did not answer: " + ex.Message.Replace(url, s.Host), 500);
+    d.Answer = null;
+  }
+  s.LastFailedAt = now;
+  s.LastTryRefused = true;
+  s.LastProblem = d.Problem;
+  Log.Warning("Webhook {Name} to {Host}: try {Attempt} of {Event} refused — {Problem}", s.Name, s.Host, d.Attempts, d.Event, d.Problem);
+  return false;
+}
+
+/// Why the platform would refuse to send `d` to its endpoint — "" when it would go: the app's and its organization's
+/// egress rules, asked with the endpoint's real address (the platform's sentence names its host only).
+string NotAllowed(WebhookDelivery d) {
+  if (d.Subscription == null) { return ""; }
+  return Http.Refusal(Crypto.Decrypt(d.Subscription!.SealedUrl));
+}
+
+/// The try that was not made because the address is not allowed — recorded as a try, in the platform's words.
+void Blocked(WebhookDelivery d, string why, DateTime now) {
+  var s = d.Subscription!;
+  d.Attempts = d.Attempts + 1;
+  d.StatusCode = null;
+  d.Answer = null;
+  d.Problem = Clip("Not sent — " + why, 500);
+  s.LastFailedAt = now;
+  s.LastTryRefused = true;
+  s.LastProblem = d.Problem;
+  Log.Warning("Webhook {Name} to {Host}: not sent — its address is not allowed", s.Name, s.Host);
+}
+
+/// Every try was refused: the delivery ends, the subscription counts it — and is paused when it keeps failing, or
+/// `atOnce` (its endpoint says it is gone, a 410; or it may not be reached at all). A test, and a second failure of one
+/// sent again, count for nothing.
+void GiveUp(WebhookDelivery d, bool atOnce) {
+  d.NextAttemptAt = null;
+  if (!d.SentAgain || d.EndedAt == null) { d.EndedAt = DateTime.UtcNow; }
+  d.Outcome = WebhookOutcome.GaveUp;
+  if (d.IsTest || d.SentAgain || d.Subscription == null) { return; }
+  var s = d.Subscription!;
+  s.FailingInARow = s.FailingInARow + 1;
+  var setup = App.Setting<WebhooksSetup>();
+  if (s.Active && (s.FailingInARow >= setup.PauseAfter || atOnce)) {
+    s.Active = false;
+    s.Paused = WebhookPause.Failing;
+    s.PausedAt = DateTime.UtcNow;
+    Log.Warning("Webhook {Name} to {Host} paused: {Count} deliveries in a row were given up on — {Problem}", s.Name, s.Host,
+      s.FailingInARow, d.Problem);
+    Raise(new WebhookPaused { Subscription = s, Why = d.Problem ?? "" });
+  }
+}
+
+/// The delivery's document is gone — and with it what the endpoint answered; the line stays.
+void RemoveBody(WebhookDelivery d) {
+  d.Body = null;
+  d.Answer = null;
+  d.BodyRemovedAt = DateTime.UtcNow;
+}
+
+/// Send a failed delivery again — one more try, while its document is kept. Committed.
+public void SendWebhookAgain(Guid deliveryId) {
+  var d = WebhookDelivery.FirstOrDefault(x => x.Id == deliveryId);
+  if (d == null) { throw new NotFoundException("That delivery is no longer in the log."); }
+  if (d!.State != WebhookDeliveryState.Failed) { throw new ValidationException("Only a delivery that failed is sent again."); }
+  if (d!.Body == null) {
+    throw new ValidationException("Its document has been removed — it was kept for a short while only, so it cannot be sent again.");
+  }
+  if (d!.Subscription == null) { throw new ValidationException("Its subscription was removed."); }
+  WebhookSending.RaiseSendAgain(d!);
+  UnitOfWork.Commit();
+}
+
+/// Send `subscriptionId` a sample of `evt` now — one try, on the log like any other. Answers the delivery. Committed.
+public Guid SendTestWebhook(Guid subscriptionId, string evt) {
+  var s = SubscriptionById(subscriptionId);
+  var choice = WebhookEventChoices().FirstOrDefault(c => c.Name == evt);
+  if (choice == null) { throw new ValidationException("Choose an event to send a sample of."); }
+  var d = new WebhookDelivery {
+    Subscription = s, SubscriptionName = s.Name, Host = s.Host, Event = evt, IsTest = true, At = DateTime.UtcNow,
+    Body = Envelope(evt, DateTime.UtcNow, DocumentFor(choice!.Source).Sample(evt)),
+  };
+  UnitOfWork.Commit();
+  return d.Id;
+}
+
+// ── signing, and checking a signature ────────────────────────────────────────────────────────────────────────────────
+
+/// The `webhook-signature` header: `v1,<signature>` under the subscription's secret — and, for a day after a roll,
+/// a second one under the previous secret, space-separated, so a receiver holding either accepts it.
+string SignaturesFor(WebhookSubscription s, DateTime now, string id, string stamp, string body) {
+  var signed = "v1," + Signature(Crypto.Decrypt(s.SealedSecret), id, stamp, body);
+  if (s.SealedPreviousSecret != null && s.PreviousUntil != null && s.PreviousUntil.Value > now) {
+    signed = signed + " v1," + Signature(Crypto.Decrypt(s.SealedPreviousSecret!), id, stamp, body);
+  }
+  return signed;
+}
+
+/// The Standard Webhooks signature: base64 of HMAC-SHA256 over `id.timestamp.body`, keyed by the secret's bytes (the
+/// base64 after `whsec_`).
+public string Signature(string secret, string id, string stamp, string body) {
+  var key = Convert.FromBase64String(secret.StartsWith("whsec_") ? secret.Substring(6) : secret);
+  return Convert.ToBase64String(Crypto.HmacSha256(key, Text.ToBytes(id + "." + stamp + "." + body)));
+}
+
+/// THE RECEIVER'S CHECK — is this request what a subscription with `secret` sent? True only when one of the `v1,`
+/// signatures in `signature` is the one `id`, `timestamp` and the body AS RECEIVED make (compared in constant time), and
+/// the timestamp is within `tolerance` of now (five minutes by default — an old request replayed is refused).
+///
+///     var ok = VerifyWebhook(Secret.RepairsHook, Request.Header("webhook-id") ?? "", Request.Header("webhook-timestamp") ?? "",
+///                            Request.Header("webhook-signature") ?? "", Request.RawBody ?? "");
+public bool VerifyWebhook(string secret, string id, string timestamp, string signature, string body, TimeSpan? tolerance = null) {
+  if (secret == "" || id == "" || timestamp == "" || signature == "") { return false; }
+  if (!Regex.IsMatch(timestamp, "^[0-9]{1,12}$")) { return false; }
+  var seconds = Convert.ToInt64(timestamp);
+  var drift = UnixSeconds(DateTime.UtcNow) - seconds;
+  var allowed = (long)(tolerance ?? TimeSpan.FromMinutes(5)).TotalSeconds;
+  if (drift > allowed || drift < -allowed) { return false; }
+  var expected = Signature(secret, id, timestamp, body);
+  var ok = false;
+  foreach (var part in signature.Split(" ")) {
+    var p = part.Trim();
+    if (!p.StartsWith("v1,")) { continue; }
+    // SECURITY-INVARIANT(webhook-payload-is-signed): a body that is not the bytes the secret signed — one character
+    // changed — fails here, compared in constant time. Guarded by tests/signing.test.osy
+    // (a_tampered_document_is_refused_by_the_receivers_check).
+    if (Crypto.FixedTimeEquals(p.Substring(3), expected)) { ok = true; }
+  }
+  return ok;
+}
+
+/// Seconds since 1970-01-01 UTC — the Standard Webhooks timestamp.
+public long UnixSeconds(DateTime at) { return (long)(at - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
+
+// ── the log, kept short ──────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Whether the hourly clock runs. ⚠ Appended, never inserted.
+public enum WebhookWatchState {
+  [Label("Checking hourly")] Watching,
+  [Label("Stopped")] Stopped,
+}
+
+/// The one row the hourly clock runs on — made with the first subscription.
+public entity WebhookWatch {
+  WebhookWatchState State;
+  security {
+    allow read, create when ManagesWebhooks;
+    deny update;
+    deny delete;
+  }
+}
+
+/// Every hour: lines older than `KeepLog` leave the log.
+public workflow WebhookClock {
+  Tracks    = WebhookWatch.State;
+  Autostart = true;
+  Initial   = Watching;
+
+  event Stop();
+
+  state Watching {
+    subscribe Stop() as Stopping {
+      Finished {
+        Within = TimeSpan.FromDays(36500);
+        Remind Tick(After = TimeSpan.FromHours(1), ThenEvery = TimeSpan.FromHours(1)) { SweepWebhookLog(DurableClock.UtcNow); }
+        Unfinished { }
+      }
+    }
+    on Stopping() { goto Stopped; }
+  }
+  terminal cancel Stopped { }
+}
+
+/// One tick at `now`: up to 500 finished lines older than `KeepLog` leave the log. Answers how many left.
+public int SweepWebhookLog(DateTime now) {
+  var cutoff = now - App.Setting<WebhooksSetup>().KeepLog;
+  var gone = 0;
+  foreach (var d in WebhookDelivery.Where(x => x.EndedAt != null && x.EndedAt < cutoff
+      && (x.State == WebhookDeliveryState.Settled || x.State == WebhookDeliveryState.Skipped)).Take(500).ToList()) {
+    d.Delete();
+    gone = gone + 1;
+  }
+  return gone;
+}

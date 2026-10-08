@@ -1,0 +1,87 @@
+// SECURITY — a subscription is its maker's: made in their own name, and sent only what they may read. Only those who
+// manage webhooks see the subscriptions and the log; nobody writes the record of what was sent.
+using Osysharp.Identity;
+using Osysharp.Webhooks;
+using WebhooksKitTests;
+using Osysharp.Http;
+
+/// SECURITY-INVARIANT(webhook-sends-only-what-its-maker-may-read) — Mia manages the webhooks but may not read the police's
+/// bikes; Olga may. A confidential repair is sent to Olga's subscription and never to Mia's — not even that it happened.
+[Test(Workshop)]
+void a_subscription_is_never_sent_a_record_its_maker_may_not_read() {
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  Subscribe("Mia's sheet", "https://sheets.example.test/mia");
+  runas (Olga) { AddWebhook("Olga's sheet", "https://sheets.example.test/olga", ["repair-booked"]); }
+  runas (Olga) { BookRepair("Police bike 17", "station@police.example.test", confidential: true); }
+  Background.Settle();
+  Assert.Equal(0, Received.Count(r => r.Url == "https://sheets.example.test/mia"));
+  Assert.Equal(1, Received.Count(r => r.Url == "https://sheets.example.test/olga"));
+  // An ordinary repair goes to both.
+  Booked("Commuter bike");
+  Assert.Equal(1, Received.Count(r => r.Url == "https://sheets.example.test/mia"));
+  Assert.Equal(2, Received.Count(r => r.Url == "https://sheets.example.test/olga"));
+}
+
+/// SECURITY-INVARIANT(webhook-subscription-is-its-makers) — what a subscription is sent is decided by who made it, so
+/// nobody makes one in somebody else's name (and borrows their reach).
+[Test(Workshop)]
+void a_subscription_is_made_in_its_makers_own_name() {
+  runas (Mia) {
+    Assert.Denied(() => {
+      new WebhookSubscription { Name = "Borrowed", Owner = Person.Single(p => p.Email == "olga@workshop.test"),
+                                SealedUrl = Crypto.Encrypt("https://evil.example.test/x"), Host = "evil.example.test",
+                                SealedSecret = Crypto.Encrypt(NewWebhookSecret()) };
+      UnitOfWork.Commit();
+    });
+  }
+}
+
+/// A mechanic sees no subscription and no line of the log, and cannot add one; nobody — a manager included — edits
+/// what was sent.
+[Test(Workshop)]
+void only_those_who_manage_webhooks_see_them_and_nobody_edits_the_log() {
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  Subscribe();
+  Booked("BMX");
+  runas (Tom) {
+    Assert.Equal(0, WebhookSubscription.Count());
+    Assert.Equal(0, WebhookDelivery.Count());
+    Assert.Denied(() => AddWebhook("Mine", "https://hooks.example.test/tom", ["repair-booked"]));
+  }
+  runas (Mia) {
+    Assert.Denied(() => {
+      var d = WebhookDelivery.Single();
+      d.Body = "{\"rewritten\":true}";
+      UnitOfWork.Commit();
+    });
+  }
+}
+
+/// SECURITY-INVARIANT(an-organizations-allowlist-bounds-any-host) — the app grants the kit any host, and its
+/// organization's allowed hosts still bound it: an endpoint outside them is refused when it is ADDED, in the platform's
+/// sentence (the host, and where to allow it); and when the organization later takes a host off its list, the next
+/// delivery is not sent, the subscription is paused at once and the app is told why. (`Http.Refusal` answers what the
+/// platform's rules say; the rules are an operator's, so a test pins them.)
+[Test(Workshop)]
+void a_host_outside_the_organizations_allowed_hosts_is_refused_when_added_and_stops_receiving_when_removed() {
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  Http.Refusal.Stub(url => url.StartsWith("https://hooks.example.test/") ? ""
+    : "`Osysharp.Webhooks` cannot reach `sheets.elsewhere.test`. Add `sheets.elsewhere.test` to your organization's allowed hosts if this app should reach it.");
+  runas (Mia) {
+    Assert.Equal("`Osysharp.Webhooks` cannot reach `sheets.elsewhere.test`. Add `sheets.elsewhere.test` to your organization's allowed hosts if this app should reach it.",
+                 Assert.Throws<ValidationException>(() => AddWebhook("Sheet", "https://sheets.elsewhere.test/in", ["repair-booked"])).Message);
+    Assert.Equal(0, WebhookSubscription.Count());
+  }
+  Subscribe();
+  Booked("Gravel bike");
+  Assert.Equal(1, Received.Count());
+  // The organization takes the host off its list.
+  Http.Refusal.Stub(url => "`Osysharp.Webhooks` cannot reach `hooks.example.test`. Add `hooks.example.test` to your organization's allowed hosts if this app should reach it.");
+  Booked("Tandem");
+  Assert.Equal(1, Received.Count());
+  var line = Log()[1];
+  Assert.Equal(WebhookDeliveryState.Failed, line.State);
+  Assert.StartsWith("Not sent — `Osysharp.Webhooks` cannot reach `hooks.example.test`.", line.Problem);
+  runas (Mia) { Assert.Equal(WebhookPause.Failing, WebhookSubscription.Single().Paused); }
+  runas (Olga) { Assert.Contains("your organization's allowed hosts", WorkshopNotice.Single().Says); }
+}

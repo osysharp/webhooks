@@ -1,0 +1,266 @@
+namespace Osysharp.Webhooks;
+
+using Osysharp.Identity;
+
+// SUBSCRIPTIONS — an endpoint, the events it takes, and the secret it checks what it receives with.
+//
+// ⚑ NOTHING HERE HOLDS A USABLE CREDENTIAL. An endpoint's URL is often one by itself (a hook URL with a token in its
+//   path), and the signing secret is one by definition — so both are SEALED with the app's own key (`Crypto.Encrypt`)
+//   and kept only as ciphertext. What a page shows is the host, the URL's last characters and the secret's, so two are
+//   told apart without either being readable. The secret's plaintext exists in exactly two places: the one answer that
+//   made (or rolled) it, and the moment a document is signed.
+
+/// Why a subscription is not being sent anything. ⚠ Appended, never inserted: an enum is stored by position.
+public enum WebhookPause {
+  /// A person paused it.
+  [Label("Paused")] ByPerson,
+  /// It was given up on too many times in a row (`PauseAfter`), or its endpoint answered that it is gone.
+  [Label("Paused — its endpoint kept failing")] Failing,
+}
+
+/// One endpoint subscribed to some of the app's events. Called by its name, and opened on the webhooks page.
+[Title($"Webhook · {Name}")]
+public entity WebhookSubscription {
+  /// What its managers call it — "Order sync", "Slack, #support". It is how they recognise it.
+  [Required("A subscription needs a name."), MaxLength(100)] string Name;
+  /// Who made it — it is sent only what they may read (the source's `MayRead`).
+  [Required] Principal Owner;
+  /// The endpoint, SEALED. There is no unsealed column holding it, anywhere.
+  // SECURITY-INVARIANT(webhook-credentials-are-sealed): a subscription's URL and signing secret are kept only as
+  // `Crypto.Encrypt` ciphertext — no column, log line or delivery row holds either in the clear, and the secret's
+  // plaintext leaves the kit once, in the answer that made (or rolled) it. Guarded by tests/signing.test.osy
+  // (the_secret_and_the_url_are_kept_nowhere_in_the_clear).
+  [Required, MaxLength(4000)] string SealedUrl;
+  /// The host it posts to, in the clear: what its managers recognise it by.
+  [Required, MaxLength(200)] string Host;
+  /// The last characters of the URL, so two subscriptions on one host are told apart.
+  [MaxLength(20)] string Tail = "";
+  /// The signing secret, SEALED.
+  [Required, MaxLength(4000)] string SealedSecret;
+  /// The secret before the last roll — still signing beside the new one until `PreviousUntil`.
+  [MaxLength(4000)] string? SealedPreviousSecret;
+  DateTime? PreviousUntil;
+  /// The secret's last characters — "…k3Zq" — so a receiver's copy can be matched by eye.
+  [MaxLength(12)] string SecretEnding = "";
+  DateTime? SecretMadeAt;
+  /// Whether it is being sent anything. Paused, nothing is queued for it; what was queued is skipped.
+  bool Active = true;
+  WebhookPause? Paused;
+  DateTime? PausedAt;
+  /// How many deliveries in a row were given up on — reset by the first that lands.
+  int FailingInARow;
+  /// The last try was refused — its endpoint is down now, as far as anybody knows.
+  bool LastTryRefused;
+  DateTime? LastDeliveredAt;
+  DateTime? LastFailedAt;
+  /// What went wrong the last time, in a sentence — "HTTP 503", "The endpoint did not answer: …".
+  [MaxLength(500)] string? LastProblem;
+  [ForeignKey(Subscription)] WebhookSubscriptionEvent[] Events;
+
+  security {
+    allow read, create, update, delete when ManagesWebhooks;
+    // SECURITY-INVARIANT(webhook-subscription-is-its-makers): a subscription is made in its maker's own name — it is
+    // sent only what they may read, so naming somebody else would borrow their access. Guarded by tests/security.test.osy
+    // (a_subscription_is_made_in_its_makers_own_name).
+    deny create where Owner != user;
+    deny update Owner;
+    // The sealed values are written by the kit's own verbs alone, and never read back by a person (the page shows the
+    // host and the endings). A masked column is dropped from the select, so only the kit's run — the app — opens them.
+    deny read SealedUrl, SealedSecret, SealedPreviousSecret when !ManagesWebhooks;
+  }
+}
+
+/// One event a subscription takes — its name ("repair-ready").
+[Unique(Subscription, Event)]
+public entity WebhookSubscriptionEvent {
+  [Required] WebhookSubscription Subscription;
+  [Required, MaxLength(140)] string Event;
+  security {
+    allow read, create, delete when ManagesWebhooks;
+    deny update;
+  }
+}
+
+/// What making a subscription answers — its id, and the secret, shown ONCE.
+public class WebhookCreated {
+  public Guid Id;
+  /// The signing secret — `whsec_…`. Give it to the receiver now: it is never shown again.
+  public string Secret = "";
+}
+
+// ── the verbs a page calls — each checks, does the one thing, and commits ────────────────────────────────────────────
+
+/// Subscribe `url` to `events` (their names — `WebhookEventChoices()` lists them), as the caller. Answers the
+/// subscription and its secret — shown once. Committed.
+public WebhookCreated AddWebhook(string name, string url, List<string> events) {
+  var me = Session.CurrentUser;
+  if (me == null) { throw new NotAuthorized("Sign in to add a webhook."); }
+  var shown = name.Trim();
+  if (shown == "") { throw new ValidationException("Give the subscription a name — it is how you will recognise it in the list."); }
+  var endpoint = CheckedUrl(url);
+  var chosen = CheckedEvents(events);
+  var secret = NewWebhookSecret();
+  var s = new WebhookSubscription {
+    Name = Clip(shown, 100), Owner = me!, SealedUrl = Crypto.Encrypt(endpoint), Host = HostOf(endpoint), Tail = TailOf(endpoint),
+    SealedSecret = Crypto.Encrypt(secret), SecretEnding = Ending(secret), SecretMadeAt = DateTime.UtcNow,
+  };
+  foreach (var e in chosen) { new WebhookSubscriptionEvent { Subscription = s, Event = e }; }
+  if (!WebhookWatch.Any()) { new WebhookWatch(); }
+  UnitOfWork.Commit();
+  // ⛔ THE URL AND THE SECRET ARE NOT IN THIS LINE AND MUST NEVER BE — the host is; the path may be a credential.
+  Log.Information("Webhook {Name} added: {Count} event(s) to {Host}", s.Name, chosen.Count, s.Host);
+  return new WebhookCreated { Id = s.Id, Secret = secret };
+}
+
+/// Rename a subscription and change the events it takes. Committed.
+[SuppressWarning("cost-unbounded-read")]   // one subscription's events
+public void ChangeWebhook(Guid id, string name, List<string> events) {
+  var s = SubscriptionById(id);
+  var shown = name.Trim();
+  if (shown == "") { throw new ValidationException("Give the subscription a name — it is how you will recognise it in the list."); }
+  var chosen = CheckedEvents(events);
+  s.Name = Clip(shown, 100);
+  List<string> had = [];
+  foreach (var e in WebhookSubscriptionEvent.Where(x => x.Subscription == s).ToList()) {
+    if (chosen.Contains(e.Event)) { had.Add(e.Event); } else { e.Delete(); }
+  }
+  foreach (var e in chosen) { if (!had.Contains(e)) { new WebhookSubscriptionEvent { Subscription = s, Event = e }; } }
+  UnitOfWork.Commit();
+}
+
+/// Point a subscription at another endpoint. Its secret stays. Committed.
+public void MoveWebhook(Guid id, string url) {
+  var s = SubscriptionById(id);
+  var endpoint = CheckedUrl(url);
+  s.SealedUrl = Crypto.Encrypt(endpoint);
+  s.Host = HostOf(endpoint);
+  s.Tail = TailOf(endpoint);
+  s.FailingInARow = 0;
+  s.LastTryRefused = false;
+  s.LastProblem = null;
+  UnitOfWork.Commit();
+  Log.Information("Webhook {Name} now posts to {Host}", s.Name, s.Host);
+}
+
+/// A new secret for a subscription — answered ONCE. The old one keeps signing beside it for a day, so the receiver can
+/// move over without missing a delivery. Committed.
+public string RollWebhookSecret(Guid id) {
+  var s = SubscriptionById(id);
+  var secret = NewWebhookSecret();
+  s.SealedPreviousSecret = s.SealedSecret;
+  s.PreviousUntil = DateTime.UtcNow.AddDays(1);
+  s.SealedSecret = Crypto.Encrypt(secret);
+  s.SecretEnding = Ending(secret);
+  s.SecretMadeAt = DateTime.UtcNow;
+  UnitOfWork.Commit();
+  Log.Information("Webhook {Name}: its signing secret was rolled; the old one signs beside it until {Until}", s.Name, s.PreviousUntil);
+  return secret;
+}
+
+/// Stop sending a subscription anything, until it is resumed. What was already queued for it is skipped. Committed.
+public void PauseWebhook(Guid id) {
+  var s = SubscriptionById(id);
+  if (!s.Active) { return; }
+  s.Active = false;
+  s.Paused = WebhookPause.ByPerson;
+  s.PausedAt = DateTime.UtcNow;
+  UnitOfWork.Commit();
+}
+
+/// Send a paused subscription its events again — from now on; what happened while it was paused is not sent. Committed.
+public void ResumeWebhook(Guid id) {
+  var s = SubscriptionById(id);
+  if (s.Active) { return; }
+  s.Active = true;
+  s.Paused = null;
+  s.PausedAt = null;
+  s.FailingInARow = 0;
+  UnitOfWork.Commit();
+}
+
+/// Remove a subscription. Its delivery log lines stay (they name it as it was) until they age out; anything still queued
+/// for it is skipped. Committed.
+[SuppressWarning("cost-unbounded-read")]   // one subscription's events, deleted with it
+public void RemoveWebhook(Guid id) {
+  var s = SubscriptionById(id);
+  var name = s.Name;
+  // Its log lines let go of it when it is deleted: the delete itself clears their reference in one statement, however
+  // many there are, and reads none of them.
+  foreach (var e in WebhookSubscriptionEvent.Where(x => x.Subscription == s).ToList()) { e.Delete(); }
+  s.Delete();
+  UnitOfWork.Commit();
+  Log.Information("Webhook {Name} removed", name);
+}
+
+WebhookSubscription SubscriptionById(Guid id) {
+  var s = WebhookSubscription.FirstOrDefault(x => x.Id == id);
+  if (s == null) { throw new NotFoundException("That subscription is gone — it may have been removed."); }
+  return s!;
+}
+
+// ── the rules a value is held to ────────────────────────────────────────────────────────────────────────────────────
+
+/// A webhook endpoint as it is kept: `https://`, a host, and nothing that is not a URL. Refused with the sentence that
+/// says what is wrong.
+public string CheckedUrl(string url) {
+  var u = url.Trim();
+  if (u == "") { throw new ValidationException("Give the endpoint's address — like https://example.com/hooks/orders."); }
+  if (!u.StartsWith("https://")) {
+    throw new ValidationException("A webhook goes to an https:// address — what it carries is signed, and must not be read on the way.");
+  }
+  if (u.Contains(" ")) { throw new ValidationException("That address has a space in it — copy it again from the receiving system."); }
+  var host = HostOf(u);
+  if (host == "" || !host.Contains(".")) {
+    throw new ValidationException($"'{host}' is not a host that can be reached from the internet.");
+  }
+  if (u.Length > 2000) { throw new ValidationException("That address is longer than 2,000 characters."); }
+  // ⭐ WHERE THE APP MAY SEND, ASKED NOW rather than learnt at the first delivery: the app grants this kit any host
+  //   (`egress "*"`), but an organization's allowed hosts — or a deny the app or the organization set — still bound
+  //   it. The platform's own sentence names the host and where to allow it. Delivery asks again before every send.
+  var refused = Http.Refusal(u);
+  if (refused != "") { throw new ValidationException(refused); }
+  return u;
+}
+
+/// The events a subscription takes — at least one, each one the app has.
+List<string> CheckedEvents(List<string> events) {
+  var offered = WebhookEventChoices().Select(c => c.Name).ToList();
+  List<string> chosen = [];
+  foreach (var e in events) {
+    var name = e.Trim();
+    if (name == "" || chosen.Contains(name)) { continue; }
+    if (!offered.Contains(name)) {
+      throw new ValidationException($"'{name}' is not an event this app sends. It sends: {string.Join(", ", offered)}.");
+    }
+    chosen.Add(name);
+  }
+  if (chosen.Count == 0) { throw new ValidationException("Choose at least one event to send."); }
+  return chosen;
+}
+
+/// The host of an https URL — "hooks.example.com".
+public string HostOf(string url) {
+  var rest = url.StartsWith("https://") ? url.Substring(8) : url;
+  var end = rest.Length;
+  foreach (var stop in ["/", "?", "#"]) {
+    var at = rest.IndexOf(stop);
+    if (at >= 0 && at < end) { end = at; }
+  }
+  var host = rest.Substring(0, end);
+  var at2 = host.LastIndexOf("@");
+  if (at2 >= 0) { host = host.Substring(at2 + 1); }
+  var colon = host.IndexOf(":");
+  if (colon >= 0) { host = host.Substring(0, colon); }
+  return host.ToLower();
+}
+
+/// The last six characters of a URL — "…/b7Qx2" — enough to tell two apart, too few to use.
+public string TailOf(string url) { return url.Length <= 6 ? "" : "…" + url.Substring(url.Length - 6); }
+
+/// A new signing secret: `whsec_` and 32 random bytes in base64 — the Standard Webhooks form, which every library takes.
+public string NewWebhookSecret() { return "whsec_" + Convert.ToBase64String(Crypto.FromHex(Security.RandomHex(64))); }
+
+/// A secret's last four characters, for matching by eye.
+string Ending(string secret) { return "…" + secret.Substring(secret.Length - 4); }
+
+string Clip(string s, int max) { return s.Length <= max ? s : s.Substring(0, max); }
