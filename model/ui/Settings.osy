@@ -21,7 +21,7 @@ public class WebhookSettingsSections : ISettingsProvider {
 }
 
 /// The webhooks, as a settings page.
-[Page("/settings/webhooks")] [Layout(SettingsFrame)] [Authorize(ManagesWebhooks)] [Render(CSR)] [Title("Webhooks")]
+[Route("/settings/webhooks")] [Layout(SettingsFrame)] [Authorize(ManagesWebhooks)] [Render(CSR)] [Title("Webhooks")]
 [Opens(WebhookSubscription)]
 public component WebhooksSettings() { render { WebhookSubscriptions(); } }
 
