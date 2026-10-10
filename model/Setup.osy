@@ -7,7 +7,7 @@ using Osysharp.Identity;
 // ⚑ EVERY EVENT IS SUBSCRIBABLE, BY ITS OWN NAME. What happens in the app — its own events and every kit's — is what an
 //   endpoint may be sent: each event about a record, under the name the platform derives from its class
 //   (`Events.Name(e)`: an app's `TicketArrived` is "ticket-arrived", a kit's `ArticlePublished` is
-//   "knowledge.article-published"), by its label. The app raises them where they happen and names nothing here.
+//   "knowledge-base.article-published"), by its label. The app raises them where they happen and names nothing here.
 
 /// Who manages webhooks — adds, tests, pauses and removes subscriptions, and reads the delivery log.
 /// `policy ManagesWebhooks => IsAdmin;`

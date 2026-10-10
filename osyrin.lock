@@ -2,43 +2,5 @@
   "platform": {
     "version": "0.9.0"
   },
-  "entries": [
-    {
-      "name": "Osysharp.Http",
-      "kind": "package",
-      "version": "1.0.0",
-      "hash": "sha256:4c24068aeea5ef1a155459d4cc332c85d7ee3d96049f2404e54ac860d94beb0f",
-      "minPlatform": "0.9.0",
-      "shadow": "app-forkable",
-      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Http"
-    },
-    {
-      "name": "Osysharp.Identity",
-      "kind": "package",
-      "version": "0.8.0",
-      "hash": "sha256:7fadb5f2628cfd6895c44d2e88725b39055ea36c3a8276b3b345c72a931f4358",
-      "minPlatform": "0.9.0",
-      "shadow": "app-forkable",
-      "source": "workspace:kits/identity",
-      "constraint": "0"
-    },
-    {
-      "name": "Osysharp.Ui",
-      "kind": "package",
-      "version": "2.18.1",
-      "hash": "sha256:5dae9b4103cc649967664228cc945c2d8b5bd9ff8d45e62bf9b67d9db079545e",
-      "minPlatform": "0.9.0",
-      "shadow": "app-forkable",
-      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Ui"
-    },
-    {
-      "name": "Osysharp.Workflow",
-      "kind": "package",
-      "version": "1.0.1",
-      "hash": "sha256:9f7ccf1f6dbf22b62e551b015333d41c46431491acd812fb626762531e2a97f8",
-      "minPlatform": "0.9.0",
-      "shadow": "app-forkable",
-      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Workflow"
-    }
-  ]
+  "entries": []
 }

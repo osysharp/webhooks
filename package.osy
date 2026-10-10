@@ -5,7 +5,7 @@
 // The kit never knows WHAT the events are about — a ticket, an order, a repair — and the app does not tell it: every
 // event the app and its kits raise about a record can be subscribed to, by its label, under the one name the platform
 // derives from its class (an app's `RepairReady` goes out as "repair-ready", a kit's `ArticlePublished` as
-// "knowledge.article-published"). The app raises its events where they happen, and — only to send its own API shape of
+// "knowledge-base.article-published"). The app raises its events where they happen, and — only to send its own API shape of
 // a record rather than its type and id — says what a document carries:
 //     app.Webhooks = new WebhooksSetup { Documents = [new RepairDocument()] };
 //     public class RepairDocument : WebhookDocument<Repair> {
@@ -39,7 +39,7 @@
 //     use Osysharp.Webhooks@0 { egress "*"; }
 //   (the platform still refuses internal addresses, and an `egress deny` the app or its organization sets).
 package Osysharp.Webhooks {
-  version     "0.4.1";
+  version     "0.4.2";
   minPlatform "0.9.0";
   summary     "outbound webhooks — an administrator subscribes an endpoint to any of the events the app and its kits raise about a record; each one is sent as a JSON document signed the Standard Webhooks way under a secret shown once and kept sealed, delivered durably after the commit with doubling retries, given up on in the end and the subscription paused when it keeps failing, every attempt in a delivery log whose documents are removed after a short declared retention; only what the subscription's maker may read is ever sent; a settings page to add, test, pause, roll the secret of and remove subscriptions and to send a failed delivery again.";
   model "model/**/*.osy";

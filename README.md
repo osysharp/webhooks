@@ -33,7 +33,7 @@ public class RepairDocument : WebhookDocument<Repair> {          // optional: wh
 ```
 
 An event goes out under its class's name: your `ReadyForPickup` as `ready-for-pickup`, a kit's `ArticlePublished` as
-`knowledge.article-published`. Nobody types an event name.
+`knowledge-base.article-published`. Nobody types an event name.
 
 ## What it does
 
