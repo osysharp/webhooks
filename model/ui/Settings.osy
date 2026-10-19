@@ -211,7 +211,7 @@ public component WebhookSubscriptions() {
         }
       }
       SettingsSection("Endpoints", description: "Each gets the events it takes, signed with its own secret. One that keeps failing is paused, and says why.") {
-        Stack(gap: 0, role: UiRole.List, label: "Endpoints") {
+        Stack(gap: 0, role: (lines.Count == 0) ? UiRole.Group : UiRole.List, label: "Endpoints") {
           if (lines.Count == 0) {
             EmptyState("No webhooks yet", body: "Add one to send this app's events to another system — your own service, an automation tool, a data warehouse.");
           }
@@ -231,7 +231,7 @@ public component WebhookSubscriptions() {
             Button("Show every endpoint", onPress: () => ShowFor(null), tone: Tone.Ghost, size: Size.Sm);
           }
         }
-        Stack(gap: 0, role: UiRole.List, label: "Delivery log") {
+        Stack(gap: 0, role: (log.Count == 0) ? UiRole.Group : UiRole.List, label: "Delivery log") {
           if (log.Count == 0) {
             EmptyState(failedOnly ? "Nothing has failed" : "Nothing sent yet",
                        body: failedOnly ? "Every document was taken by its endpoint." : "When an event happens, each document sent for it is listed here.");

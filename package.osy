@@ -39,8 +39,8 @@
 //     use Osysharp.Webhooks@0 { egress "*"; }
 //   (the platform still refuses internal addresses, and an `egress deny` the app or its organization sets).
 package Osysharp.Webhooks {
-  version     "0.4.2";
-  minPlatform "0.9.0";
+  version     "0.5.0";
+  minPlatform "0.14.0";
   summary     "outbound webhooks — an administrator subscribes an endpoint to any of the events the app and its kits raise about a record; each one is sent as a JSON document signed the Standard Webhooks way under a secret shown once and kept sealed, delivered durably after the commit with doubling retries, given up on in the end and the subscription paused when it keeps failing, every attempt in a delivery log whose documents are removed after a short declared retention; only what the subscription's maker may read is ever sent; a settings page to add, test, pause, roll the secret of and remove subscriptions and to send a failed delivery again.";
   model "model/**/*.osy";
   // The personal data its own fields hold (`[Classification(Personal.X)]`): the documents it sends.
