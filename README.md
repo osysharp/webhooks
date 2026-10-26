@@ -78,3 +78,103 @@ events an endpoint takes, retried with doubling waits and given up on, a failing
 delivery sent again, documents removed after three days and lines after thirty, nothing sent about a record its
 subscription's maker may not read, and the page — wide and on a phone, light and dark — run with `osy test`, and
 photographed in a real browser with `osy test --pixels`.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Webhooks;
+using WebhooksKitTests;
+using Osysharp.Http;
+
+[Test(Workshop)]
+void removing_a_subscription_reads_the_same_however_long_its_log_is() {
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  var few = Subscribe("Few", "https://hooks.example.test/few", ["repair-booked"]);
+  for (var i = 1; i <= 2; i++) { Booked("Bike " + i); }
+  var fewRows = 0;
+  var fewStatements = 0;
+  runas (Mia) {
+    var mark = Cost.Mark();
+    RemoveWebhook(few.Id);
+    fewRows = Cost.RowsReadSince(mark);
+    fewStatements = Cost.StatementsSince(mark);
+  }
+  var many = Subscribe("Many", "https://hooks.example.test/many", ["repair-booked"]);
+  for (var i = 1; i <= 20; i++) { Booked("Cycle " + i); }
+  runas (Mia) {
+    var mark = Cost.Mark();
+    RemoveWebhook(many.Id);
+    var manyRows = Cost.RowsReadSince(mark);
+    var manyStatements = Cost.StatementsSince(mark);
+    Log.Information("RemoveWebhook: " + fewRows + " rows read / " + fewStatements + " statements with two lines, "
+                    + manyRows + " / " + manyStatements + " with twenty");
+    Assert.Equal(fewRows, manyRows);
+    Assert.Equal(fewStatements, manyStatements);
+  }
+  // The lines outlive it, naming it as it was.
+  Assert.Equal(22, Log().Count(l => l.SubscriptionName == "Few" || l.SubscriptionName == "Many"));
+}
+```
+
+From [`tests/cost.test.osy`](tests/cost.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Webhooks;
+using WebhooksKitTests;
+using Osysharp.Http;
+
+[Test(Workshop)]
+void an_event_nobody_takes_costs_nothing() {
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 200));
+  Subscribe(events: ["repair-collected"]);
+  Booked("Road bike");
+  Assert.Equal(0, Received.Count());
+  Assert.Equal(0, Log().Count);
+}
+```
+
+From [`tests/delivery.test.osy`](tests/delivery.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Webhooks;
+using WebhooksKitTests;
+using Osysharp.Http;
+
+[Test(Workshop)]
+void a_failed_document_is_removed_three_days_after_it_was_given_up_on() {
+  TestClock.Set(new DateTime(2030, 5, 6, 9, 0, 0));
+  Http.Post.Stub((url, body, headers) => Answer(url, body, headers, 410));
+  Subscribe();
+  Booked("Tricycle", "zeb-failed-4410@example.test");
+  Assert.Equal(WebhookDeliveryState.Failed, Log()[0].State);
+  runas (Mia) { Assert.Equal("upstream unavailable", WebhookDelivery.Single().Answer); }
+  TestClock.Advance(TimeSpan.FromDays(3) + TimeSpan.FromMinutes(1));
+  Background.Settle();
+  Assert.False(Log()[0].HasBody);
+  Assert.Equal(WebhookOutcome.GaveUp, Log()[0].Outcome);
+  runas (Mia) {
+    Assert.Null(WebhookDelivery.Single().Answer);
+    Assert.False(WebhookDelivery.Any(d => d.Body != null && d.Body.Contains("zeb-failed-4410")));
+    Assert.Equal("Only a delivery that failed is sent again.",
+                 Assert.Throws<ValidationException>(() => SendWebhookAgain(WebhookDelivery.Single().Id)).Message);
+  }
+}
+```
+
+From [`tests/retention.test.osy`](tests/retention.test.osy).
+
+## Learn more
+
+- [The Osysharp.Webhooks reference](https://osysharp.com/reference/ui/webhooks-kit/)
+- [Osysharp.Webhooks in the package catalogue](https://osysharp.com/packages/#osysharp-webhooks)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).

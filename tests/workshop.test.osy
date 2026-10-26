@@ -5,7 +5,7 @@ using Osysharp.Webhooks;
 using WebhooksKitTests;
 using Osysharp.Http;
 
-[TestFixture]
+[TestFixture, DevSeed("A bike workshop that sends webhooks")]
 void Workshop() {
   var olga = new Person { Email = "olga@workshop.test", DisplayName = "Olga Berg" };
   new RoleGrant { Member = olga, Role = WorkshopRole.Owner };
