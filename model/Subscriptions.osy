@@ -216,7 +216,9 @@ public string CheckedUrl(string url) {
   if (u.Length > 2000) { throw new ValidationException("That address is longer than 2,000 characters."); }
   // ⭐ WHERE THE APP MAY SEND, ASKED NOW rather than learnt at the first delivery: the app grants this kit any host
   //   (`egress "*"`), but an organization's allowed hosts — or a deny the app or the organization set — still bound
-  //   it. The platform's own sentence names the host and where to allow it. Delivery asks again before every send.
+  //   it. The platform's own sentence names the host and who refused it: the app's own rule says how to lift it; the
+  //   organization's (its policy, or its two host lists) says only that it does not allow the host, with the policy's
+  //   reason when it has one — never its list or a remedy (ORGPOL OP-E3g). Delivery asks again before every send.
   var refused = Http.Refusal(u);
   if (refused != "") { throw new ValidationException(refused); }
   return u;
